@@ -339,6 +339,11 @@ describe('truncateHunks', () => {
     expect(omittedLines).toBe(2)
   })
 
+  test('a header whose context holds a CR or U+2028 is still rewritten', async () => {
+    const source = '@@ -1,4 +1,4 @@ a\rb\u2028c\n x\n-y\n+z\n w'
+    expect(truncateHunks(source, 3).hunks).toBe('@@ -1,2 +1,1 @@ a\rb\u2028c\n x\n-y')
+  })
+
   test('a cut right after a header drops that header, which counts as no line', async () => {
     const source = '@@ -1 +1 @@\n-a\n+b\n@@ -9 +9 @@\n-c\n+d'
     expect(truncateHunks(source, 4)).toEqual({ hunks: '@@ -1 +1 @@\n-a\n+b', omittedLines: 2 })
@@ -1394,8 +1399,8 @@ describe('git helper', () => {
     await git(deps, '/w', ['status'])
     await git(deps, '/w', ['diff', '--stat'])
     expect(seen).toEqual([
-      ['git', '-c', 'core.quotePath=false', '-c', 'diff.suppressBlankEmpty=false', '--no-optional-locks', 'status'],
-      ['git', '-c', 'core.quotePath=false', '-c', 'diff.suppressBlankEmpty=false', '--no-optional-locks', 'diff', '--no-color', '--no-ext-diff', '--stat'],
+      ['git', '-c', 'core.quotePath=false', '-c', 'diff.suppressBlankEmpty=false', '-c', 'diff.context=3', '--no-optional-locks', 'status'],
+      ['git', '-c', 'core.quotePath=false', '-c', 'diff.suppressBlankEmpty=false', '-c', 'diff.context=3', '--no-optional-locks', 'diff', '--no-color', '--no-ext-diff', '--stat'],
     ])
   })
 })

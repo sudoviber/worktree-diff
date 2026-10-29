@@ -36,6 +36,10 @@ export const GIT_PREFIX = [
   // Blank context lines keep their leading space, so hunks stay parseable.
   '-c',
   'diff.suppressBlankEmpty=false',
+  // A user's diff.context=0 would make a hunk at the top of a file look like
+  // a whole added file, and changes the engine's diff view too.
+  '-c',
+  'diff.context=3',
   '--no-optional-locks',
 ] as const
 
@@ -258,7 +262,11 @@ export const splitHunks = (diff: string): string => {
   return trimEnd(kept.join('\n'))
 }
 
-const HUNK_HEADER = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/
+/**
+ * A hunk header: old start, new start, the function context after it. `s`
+ * lets the context hold a `\r` or U+2028, which git keeps from the source.
+ */
+export const HUNK_HEADER = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/s
 
 /**
  * Cuts hunks to `maxLines` lines and `maxChars` characters, rewriting the
