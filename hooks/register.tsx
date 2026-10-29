@@ -23,6 +23,25 @@ import {
   type UntrackedCache,
 } from './git'
 import { addedSource, charWidth, parseHunks, type DiffLine } from './diff-lines'
+import {
+  clampOffset,
+  moveCursor,
+  moveDiff,
+  numberHunks,
+  paneLayout,
+  refreshedTreeWindow,
+  rowBudget,
+  scrollBy,
+  treeWindow,
+  wheelRegion,
+  windowHunks,
+  type CursorMove,
+  type DiffMove,
+  type NumberedDiff,
+  type PaneLayout,
+  type Region,
+  type RowBudget,
+} from './layout'
 import { baseName, buildTree, dirPaths, isAllFolded, visibleRows, type Tree, type TreeDir, type TreeRow } from './tree'
 
 type Dollar = EngineInterface
@@ -51,6 +70,39 @@ const NAV_KEYS = [
   { hotkey: 'q', label: 'close' },
 ] as const
 type NavKey = (typeof NAV_KEYS)[number]['hotkey']
+/**
+ * diffView side: one Button per hotkey, each acting by the region the keys are
+ * in. Half a page up is `b`: `u` stays the uncommitted tab. Drawn in this
+ * order on the hint row, which shows as many as fit; the rest still press.
+ */
+const SIDE_KEYS: Record<Region, readonly { hotkey: SideKey; label: string }[]> = {
+  tree: [
+    { hotkey: 'j', label: 'down' },
+    { hotkey: 'k', label: 'up' },
+    { hotkey: 'l', label: 'open' },
+    { hotkey: 'w', label: 'diff' },
+    { hotkey: 'h', label: 'fold' },
+    { hotkey: 'q', label: 'close' },
+    { hotkey: 'd', label: 'page' },
+    { hotkey: 'b', label: 'back' },
+    { hotkey: 'g', label: 'top' },
+    { hotkey: 'e', label: 'end' },
+  ],
+  diff: [
+    { hotkey: 'j', label: 'down' },
+    { hotkey: 'k', label: 'up' },
+    { hotkey: 'd', label: 'page' },
+    { hotkey: 'b', label: 'back' },
+    { hotkey: 'n', label: 'next' },
+    { hotkey: 'p', label: 'prev' },
+    { hotkey: 'h', label: 'tree' },
+    { hotkey: 'q', label: 'close' },
+    { hotkey: 'g', label: 'top' },
+    { hotkey: 'e', label: 'end' },
+    { hotkey: 'w', label: 'tree' },
+  ],
+}
+export type SideKey = 'j' | 'k' | 'd' | 'b' | 'n' | 'p' | 'g' | 'e' | 'l' | 'h' | 'w' | 'q'
 const isNavKey = (key: string) => key.startsWith('nav:')
 const isRowKey = (key: string) => key.startsWith('file:') || key.startsWith('dir:')
 // Compared by name: a build may not register every one of them.
@@ -91,6 +143,10 @@ const viewAtom = atom({ plugin: 'worktree-diff', key: 'view' } as const, 'tree')
 const collapsedAtom = atom({ plugin: 'worktree-diff', key: 'collapsedDirs' } as const, [], {
   shape: 'collapsed-1',
 })
+const cursorAtom = atom({ plugin: 'worktree-diff', key: 'cursor' } as const, null, { shape: 'cursor-1' })
+const regionAtom = atom({ plugin: 'worktree-diff', key: 'region' } as const, 'tree', { shape: 'region-1' })
+const diffOffsetAtom = atom({ plugin: 'worktree-diff', key: 'diffOffset' } as const, 0, { shape: 'offset-1' })
+const treeOffsetAtom = atom({ plugin: 'worktree-diff', key: 'treeOffset' } as const, 0, { shape: 'offset-1' })
 
 // ----------------------------------------------------------------- config
 
@@ -99,16 +155,19 @@ type AutoOpen = 'worktree' | 'always' | 'never'
 type DiffStyle = 'quiet' | 'engine'
 /** transparent: the terminal's own background shows through the pane; theme: the surface's pane fill. */
 type PaneBackground = 'transparent' | 'theme'
+/** side: the cursor's file in a region beside the tree; inline: each opened file under its row. */
+type DiffView = 'side' | 'inline'
 type Config = {
   autoOpen: AutoOpen
   pollSeconds: number
   statusLine: boolean
   diffStyle: DiffStyle
   paneBackground: PaneBackground
+  diffView: DiffView
 }
 
 export const readConfig = (options: PluginOptions): Config => {
-  const { autoOpen, pollSeconds, statusLine, diffStyle, paneBackground } = options
+  const { autoOpen, pollSeconds, statusLine, diffStyle, paneBackground, diffView } = options
   const poll = pollSeconds === undefined ? 5 : Number(pollSeconds)
 
   return {
@@ -117,6 +176,7 @@ export const readConfig = (options: PluginOptions): Config => {
     statusLine: statusLine === true,
     diffStyle: diffStyle === 'engine' ? 'engine' : 'quiet',
     paneBackground: paneBackground === 'theme' ? 'theme' : 'transparent',
+    diffView: diffView === 'inline' ? 'inline' : 'side',
   }
 }
 
@@ -329,6 +389,10 @@ let lastRowKey: string | undefined
 let rowMoves = 0
 /** The key presses still running, one after another: each reads where the last one left the ring. */
 let navChain: Promise<void> = Promise.resolve()
+/** diffView side: the regions as last drawn, for the wheel and for how far a key moves; lost on a reload until the next drawing. */
+let frame: Frame | undefined
+/** diffView side: the wait before the cursor's file is read, so keys held down read only where they stop. */
+let preview: Timer | undefined
 
 /** The pane as `$.ui.panes()` lists it; open but undrawn on a narrow terminal is `isPlaced: false`, a tab behind another `isShown: false`. */
 const paneState = async ($: Dollar) => {
@@ -378,12 +442,16 @@ const learnLayout = ($: Dollar, isFullscreen: boolean | undefined) => {
   else if (wantsAutoOpen) schedule($)
 }
 
-// Every open sets the backdrop anew; left out, the surface's own fill stands.
+/** Body columns the side view asks the dock for: the engine holds it to 45% of the terminal. */
+const SIDE_COLUMNS = 120
+
+// Every open sets the backdrop and the width anew; left out, the surface's own fill stands.
 const paneArgs = (raise: boolean) => ({
   id: PANE,
   title: TITLE,
   ...(raise ? { focus: true as const } : {}),
   ...(config.paneBackground === 'transparent' ? { backgroundColor: 'transparent' } : {}),
+  ...(config.diffView === 'side' ? { columns: SIDE_COLUMNS } : {}),
 })
 
 /** A reload with the pane on screen opens it again, so a changed backdrop applies at once. */
@@ -514,8 +582,13 @@ const refreshOnce = async ($: Dollar, force: boolean): Promise<Snapshot | null> 
   if (previous?.signature !== snapshot.signature) await update($, snapshotAtom, () => snapshot)
   // A failed read lists nothing: keep what is open until git answers again.
   if (snapshot.error === undefined || snapshot.files.length > 0) {
-    await syncDiffs($, deps, snapshot)
-    await pruneCollapsed($, snapshot)
+    if (config.diffView === 'side') {
+      await pruneCollapsed($, snapshot)
+      await syncSide($, deps, previous)
+    } else {
+      await syncDiffs($, deps, snapshot)
+      await pruneCollapsed($, snapshot)
+    }
   }
   if (config.statusLine) await showStatus($, snapshot)
   // Until a drawing says whether panes dock, the open stays pending.
@@ -602,6 +675,7 @@ const toggleView = async ($: Dollar) => {
   isViewLoaded = true
   viewToggles += 1
   await update($, viewAtom, view => (view === 'tree' ? 'list' : 'tree'))
+  if (config.diffView === 'side') await inTurn(() => settleCursor($))
   try {
     await $.store.set(VIEW_KEY, await read($, viewAtom))
   } catch {
@@ -613,6 +687,7 @@ const toggleDir = async ($: Dollar, path: string) => {
   await update($, collapsedAtom, paths =>
     paths.includes(path) ? paths.filter(one => one !== path) : [...paths, path],
   )
+  if (config.diffView === 'side') await settleCursor($)
 }
 
 /** Collapses every directory, nested ones too, or expands them all when the tree reads as all folded. */
@@ -621,6 +696,7 @@ const foldAll = async ($: Dollar) => {
   if (snapshot === null) return
   const tree = buildTree(snapshot.files)
   await update($, collapsedAtom, paths => (isAllFolded(tree, paths) ? [] : dirPaths(tree)))
+  if (config.diffView === 'side') await inTurn(() => settleCursor($))
 }
 
 const setMode = async ($: Dollar, mode: DiffMode) => {
@@ -685,6 +761,7 @@ const setTrunk = async ($: Dollar, ref: string | undefined): Promise<string> => 
 }
 
 export const FOCUSED = 'Changes pane focused — j/k move · enter open · esc back · q close'
+export const FOCUSED_SIDE = 'Changes pane focused — j/k move · w diff/tree · esc back · q close'
 export const UNFOCUSED = 'Changes pane opened — ctrl+x tab to focus'
 
 /** Where the ring starts on these rows: the row it last held, else the first. */
@@ -701,9 +778,16 @@ const listingNow = async ($: Dollar) => {
     read($, viewAtom),
     read($, collapsedAtom),
   ])
-  const tree = view === 'tree' && snapshot?.isRepo === true ? buildTree(snapshot.files) : null
 
-  return { rows: listedRows(snapshot, tree, collapsedDirs).map(navRow), collapsedDirs }
+  return { ...listingOf(snapshot, view, collapsedDirs), snapshot, collapsedDirs }
+}
+
+/** A snapshot's rows in a view; `total` counts the `… N more files` line after them too. */
+const listingOf = (snapshot: Snapshot | null, view: ViewMode, collapsedDirs: readonly string[]) => {
+  const tree = view === 'tree' && snapshot?.isRepo === true ? buildTree(snapshot.files) : null
+  const rows = listedRows(snapshot, tree, collapsedDirs).map(navRow)
+
+  return { rows, total: rows.length + (rows.length > 0 && (snapshot?.omittedFiles ?? 0) > 0 ? 1 : 0) }
 }
 
 /**
@@ -715,7 +799,11 @@ const ringOnFirstRows = async ($: Dollar, refreshed: Promise<Snapshot | null>) =
   const moves = rowMoves
   await refreshed
   if (rowMoves !== moves || (await paneState($))?.isFocused !== true) return
-  const key = ringStart((await listingNow($)).rows.map(row => row.key))
+  const { rows } = await listingNow($)
+  const key =
+    config.diffView === 'side'
+      ? sideRing(frame?.layout, await read($, regionAtom), keptCursor([], rows, await read($, cursorAtom)))
+      : ringStart(rows.map(row => row.key))
   // Not yet drawn, the row is waited for.
   if (key !== undefined) await focusRow($, key)
 }
@@ -735,8 +823,9 @@ const focusPane = async ($: Dollar) => {
   }
   const isFocused = (await paneState($))?.isFocused === true
   background(isUnread && isFocused ? ringOnFirstRows($, refreshed) : refreshed)
+  if (!isFocused) return UNFOCUSED
 
-  return isFocused ? FOCUSED : UNFOCUSED
+  return config.diffView === 'side' ? FOCUSED_SIDE : FOCUSED
 }
 
 const closePane = async ($: Dollar) => {
@@ -859,6 +948,345 @@ export const inTurn = (press: () => Promise<void>): Promise<void> => {
   return navChain
 }
 
+// -------------------------------------------------------------- side view
+
+/** diffView side: the cursor, the region the keys act on, and where each region's window starts. */
+export type SideState = { cursor: string | null; region: Region; diffOffset: number; treeOffset: number }
+
+/** The regions as last drawn: their layout, the body's rows as split, and the rows of the tree and of the diff each window shows. */
+export type Frame = { layout: PaneLayout; budget: RowBudget; treeRows: number; diffRows: number }
+
+/** With one region shown and that the diff, the cursor's row is not drawn: the ring waits on h's Button, which goes back. */
+const SINGLE_DIFF_RING = 'nav:h'
+
+/** Where the side view's ring sits: on the cursor's row, or on h's Button while the diff alone shows. */
+export const sideRing = (layout: PaneLayout | undefined, region: Region, cursor: string | null): string | undefined =>
+  region === 'diff' && layout?.kind === 'single' ? SINGLE_DIFF_RING : (cursor ?? undefined)
+
+/** How far a key moves before the pane is first drawn after a reload. */
+const FALLBACK_ROWS = 10
+/** The cursor stands this long before its file is read. */
+const PREVIEW_MS = 120
+/** Diffs kept for files the cursor left, so going back shows them at once. */
+const PREVIEW_KEEP = 16
+
+// Each writes only a value that differs: a write draws the pane again.
+const putCursor = async ($: Dollar, value: string) => {
+  if ((await read($, cursorAtom)) !== value) await update($, cursorAtom, () => value)
+}
+const putRegion = async ($: Dollar, value: Region) => {
+  if ((await read($, regionAtom)) !== value) await update($, regionAtom, () => value)
+}
+const putDiffOffset = async ($: Dollar, value: number) => {
+  if ((await read($, diffOffsetAtom)) !== value) await update($, diffOffsetAtom, () => value)
+}
+const putTreeOffset = async ($: Dollar, value: number) => {
+  if ((await read($, treeOffsetAtom)) !== value) await update($, treeOffsetAtom, () => value)
+}
+
+/**
+ * Where the cursor goes on the rows listed now (`after`): it stays on its
+ * row; one gone from what was listed (`before`) gives way to the nearest row
+ * left, below it first; one a fold hides, to the directory that hides it;
+ * otherwise the first row. Unchanged when nothing is listed.
+ */
+export const keptCursor = (
+  before: readonly NavRow[],
+  after: readonly NavRow[],
+  cursor: string | null,
+): string | null => {
+  const first = after[0]
+  if (first === undefined) return cursor
+  if (cursor === null) return first.key
+  const listed = new Set(after.map(row => row.key))
+  if (listed.has(cursor)) return cursor
+  const at = before.findIndex(row => row.key === cursor)
+  if (at >= 0) {
+    const near = before.slice(at + 1).find(row => listed.has(row.key)) ?? before.slice(0, at).reverse().find(row => listed.has(row.key))
+    if (near !== undefined) return near.key
+  }
+  const path = cursor.slice(cursor.indexOf(':') + 1)
+  let holder: NavRow | undefined
+  for (const row of after) {
+    if (row.kind === 'dir' && path.startsWith(`${row.path}/`) && row.path.length > (holder?.path.length ?? -1)) holder = row
+  }
+
+  return (holder ?? first).key
+}
+
+/** The index of the row the cursor shows on, as keptCursor places it; -1 with no rows. */
+const cursorAt = (rows: readonly NavRow[], cursor: string | null): number => {
+  const key = keptCursor([], rows, cursor)
+
+  return rows.findIndex(row => row.key === key)
+}
+
+/** What the diff region shows for the cursor's row: rows a window slides over. */
+export type SideBody =
+  | { kind: 'none' }
+  | { kind: 'note'; text: string; isError: boolean }
+  | { kind: 'dir'; path: string; files: FileChange[] }
+  | { kind: 'source'; path: string; lines: string[]; more: string | null }
+  | { kind: 'lines'; path: string; diff: NumberedDiff; more: string | null }
+
+const moreLines = (diff: FileDiff): string | null =>
+  diff.omittedLines > 0 ? `… ${diff.omittedLines} more lines — open in editor` : null
+
+/**
+ * The body for `row`: a directory's files, a deleted file in a line, a file
+ * added whole as source, any other as numbered diff lines; a note while its
+ * diff is on its way, failed, binary or empty.
+ */
+export const sideBody = (snapshot: Snapshot | null, row: NavRow | undefined, diff: FileDiff | undefined): SideBody => {
+  if (snapshot === null || row === undefined) return { kind: 'none' }
+  if (row.kind === 'dir') {
+    return { kind: 'dir', path: row.path, files: snapshot.files.filter(file => file.path.startsWith(`${row.path}/`)) }
+  }
+  const file = snapshot.files.find(one => one.path === row.path)
+  if (file === undefined) return { kind: 'none' }
+  const note = (text: string, isError = false): SideBody => ({ kind: 'note', text, isError })
+  if (!needsDiff(file)) return note(`deleted · ${file.removed} ${file.removed === 1 ? 'line' : 'lines'}`, true)
+  if (diff === undefined) return note('loading…')
+  if (diff.error !== undefined) return note(oneLine(diff.error), true)
+  if (diff.isBinary) return note('Binary file')
+  if (diff.hunks === '') return note('No textual changes')
+  const added = addedSource(diff.hunks)
+  if (added !== null) return { kind: 'source', path: file.path, lines: added.split('\n'), more: moreLines(diff) }
+
+  return { kind: 'lines', path: file.path, diff: numberHunks(diff.hunks), more: moreLines(diff) }
+}
+
+/** A body's rows, a hunk header and the `… more lines` line each one, and the row each hunk starts on. */
+export const bodyRows = (body: SideBody): { total: number; hunkStarts: readonly number[] } => {
+  switch (body.kind) {
+    case 'none':
+      return { total: 0, hunkStarts: [] }
+    case 'note':
+      return { total: 1, hunkStarts: [] }
+    case 'dir':
+      return { total: body.files.length, hunkStarts: [] }
+    case 'source':
+      return { total: body.lines.length + (body.more !== null ? 1 : 0), hunkStarts: [] }
+    case 'lines':
+      return { total: body.diff.lines.length + (body.more !== null ? 1 : 0), hunkStarts: body.diff.hunkStarts }
+  }
+}
+
+/** The listing now, the row the cursor shows on and what the diff region shows for it. */
+const sideNow = async ($: Dollar) => {
+  const [listing, cursor, diffs] = await Promise.all([listingNow($), read($, cursorAtom), read($, diffsAtom)])
+  const at = cursorAt(listing.rows, cursor)
+  const row = listing.rows[at]
+  const body = sideBody(listing.snapshot, row, row?.kind === 'file' ? diffs[row.path] : undefined)
+
+  return { ...listing, cursor, at, row, body }
+}
+
+/** Keeps the diffs of the last files the cursor was on; `path`, just read, among them. */
+export const keepRecent = (diffs: Readonly<Record<string, FileDiff>>, path: string): Record<string, FileDiff> => {
+  const others = Object.keys(diffs).filter(key => key !== path)
+  const out: Record<string, FileDiff> = {}
+  for (const key of others.slice(Math.max(0, others.length - (PREVIEW_KEEP - 1)))) out[key] = diffs[key] as FileDiff
+  if (diffs[path] !== undefined) out[path] = diffs[path]
+
+  return out
+}
+
+/**
+ * Reads the diff of the file the cursor is on into the pane. One kept shows
+ * meanwhile, but is read again all the same: its snapshot's signature counts
+ * lines, so an edit that keeps them leaves it equal.
+ */
+const loadPreview = async ($: Dollar, deps: GitDeps = gitDeps($)) => {
+  const { snapshot, row } = await sideNow($)
+  const file = row?.kind === 'file' ? snapshot?.files.find(one => one.path === row.path) : undefined
+  if (!snapshot || !file || !needsDiff(file)) return
+  const diff = await loadFileDiff(deps, snapshot, file)
+  // A pass read a newer snapshot meanwhile: its own read follows.
+  if ((await read($, snapshotAtom))?.signature !== snapshot.signature) return
+  const now = (await read($, diffsAtom))[file.path]
+  if (now !== undefined && sameDiff(now, diff) && now.signature === diff.signature) return
+  await update($, diffsAtom, diffs => keepRecent({ ...without(diffs, file.path), [file.path]: diff }, file.path))
+}
+
+/** Reads the cursor's file once it stands still: keys held down read only where they stop. */
+const previewSoon = ($: Dollar) => {
+  preview?.cancel()
+  preview = $.clock.after(PREVIEW_MS, () => {
+    preview = undefined
+    background(loadPreview($))
+  })
+}
+
+/**
+ * Keeps the cursor on a listed row (keptCursor, `before` what a refresh's
+ * last pass listed) and the tree's window on it; a cursor that moved starts
+ * its diff at the top, has it read and takes the ring along. After a refresh
+ * the cursor that stayed keeps its place on screen, or out of view where a
+ * wheel took it. Runs in a key's turn (inTurn): a press in flight would move
+ * the cursor under it.
+ */
+const settleCursor = async ($: Dollar, before?: { rows: readonly NavRow[]; total: number }) => {
+  const { rows, total } = await listingNow($)
+  const cursor = await read($, cursorAtom)
+  const key = keptCursor(before?.rows ?? [], rows, cursor)
+  if (key === null || rows.length === 0) return
+  if (key !== cursor) {
+    await putCursor($, key)
+    await putDiffOffset($, 0)
+    previewSoon($)
+  }
+  const at = rows.findIndex(row => row.key === key)
+  const offset = await read($, treeOffsetAtom)
+  const height = frame?.treeRows ?? FALLBACK_ROWS
+  const was = before !== undefined && key === cursor ? before.rows.findIndex(row => row.key === key) : -1
+  await putTreeOffset($, refreshedTreeWindow(offset, was, before?.total ?? 0, at, total, height))
+  // The ring's row is gone or hidden: left alone, the engine puts it elsewhere and Enter presses that.
+  if (key !== cursor && sideRing(frame?.layout, await read($, regionAtom), key) === key) await focusRow($, key)
+}
+
+/**
+ * After a pass: the cursor on a row still listed, diffs read under another
+ * snapshot dropped but the cursor's, and the cursor's file read again; under
+ * another mode or base its diff starts at the top.
+ */
+/** Whether two snapshots diff against different things: another mode or base. */
+const comparesOther = (one: Snapshot, other: Snapshot): boolean => one.mode !== other.mode || one.base?.ref !== other.base?.ref
+
+const syncSide = async ($: Dollar, deps: GitDeps, previous: Snapshot | null) => {
+  await inTurn(async () => {
+    const [view, collapsedDirs, now] = await Promise.all([read($, viewAtom), read($, collapsedAtom), read($, snapshotAtom)])
+    await settleCursor($, listingOf(previous, view, collapsedDirs))
+    if (previous !== null && now !== null && comparesOther(previous, now)) await putDiffOffset($, 0)
+  })
+  const { snapshot, row } = await sideNow($)
+  if (snapshot === null) return
+  const isKept = (path: string, diff: FileDiff) =>
+    diff.signature === snapshot.signature || (row?.kind === 'file' && row.path === path)
+  if (Object.entries(await read($, diffsAtom)).some(([path, diff]) => !isKept(path, diff))) {
+    await update($, diffsAtom, diffs => Object.fromEntries(Object.entries(diffs).filter(([path, diff]) => isKept(path, diff))))
+  }
+  await loadPreview($, deps)
+}
+
+/** Puts the cursor on the row keyed `key`, in the tree's window; `isRing`: the focus ring goes with it. */
+const cursorTo = async ($: Dollar, rows: readonly NavRow[], total: number, key: string, isRing: boolean) => {
+  const at = rows.findIndex(row => row.key === key)
+  if (at < 0) return
+  if ((await read($, cursorAtom)) !== key) {
+    await putCursor($, key)
+    await putDiffOffset($, 0)
+    previewSoon($)
+  }
+  const offset = await read($, treeOffsetAtom)
+  await putTreeOffset($, treeWindow(offset, at, total, frame?.treeRows ?? FALLBACK_ROWS))
+  if (isRing) await focusRow($, key)
+}
+
+/** The keys act on the diff; with the diff alone shown, the ring waits on h's Button. */
+const toDiff = async ($: Dollar) => {
+  await putRegion($, 'diff')
+  const ring = sideRing(frame?.layout, 'diff', null)
+  if (ring !== undefined) await focusRow($, ring)
+}
+
+/** The keys act on the tree again, the ring on the cursor's row. */
+const toTree = async ($: Dollar, row: NavRow | undefined) => {
+  await putRegion($, 'tree')
+  if (row !== undefined) await focusRow($, row.key)
+}
+
+const CURSOR_MOVES: Partial<Record<SideKey, CursorMove>> = {
+  j: 'down',
+  k: 'up',
+  d: 'pageDown',
+  b: 'pageUp',
+  g: 'top',
+  e: 'bottom',
+}
+const DIFF_MOVES: Partial<Record<SideKey, DiffMove>> = {
+  j: 'down',
+  k: 'up',
+  d: 'pageDown',
+  b: 'pageUp',
+  n: 'nextHunk',
+  p: 'prevHunk',
+  g: 'top',
+  e: 'bottom',
+}
+
+/**
+ * A key Button's press in the side view, by the region the keys are in. In
+ * the tree j/k/d/b/g/e move the cursor, w and l on a file go to the diff, h
+ * and l on a directory fold, open and go in or up as v0.3's do. In the diff
+ * the same letters scroll it, n/p by hunk, h and w go back to the tree.
+ */
+const pressSide = async ($: Dollar, key: SideKey) => {
+  if (key === 'q') {
+    await closePane($)
+    return
+  }
+  const [now, region] = await Promise.all([sideNow($), read($, regionAtom)])
+  if (region === 'diff') {
+    const move = DIFF_MOVES[key]
+    if (move !== undefined) {
+      const { total, hunkStarts } = bodyRows(now.body)
+      const rows = frame?.diffRows ?? FALLBACK_ROWS
+      await putDiffOffset($, moveDiff(await read($, diffOffsetAtom), move, { total, rows, hunkStarts }))
+    } else if (key === 'h' || key === 'w') await toTree($, now.row)
+    return
+  }
+  const move = CURSOR_MOVES[key]
+  if (move !== undefined) {
+    const to = now.rows[moveCursor(now.at, move, now.rows.length, frame?.treeRows ?? FALLBACK_ROWS)]
+    if (to !== undefined) await cursorTo($, now.rows, now.total, to.key, true)
+    return
+  }
+  const { row } = now
+  if (key === 'w' || (key === 'l' && row?.kind === 'file')) {
+    await toDiff($)
+    return
+  }
+  if (row === undefined || (key !== 'l' && key !== 'h')) return
+  const action = navAction(now.rows, row.key, key, one => one.kind === 'dir' && !now.collapsedDirs.includes(one.path))
+  if (action === null) return
+  if ('focus' in action) await cursorTo($, now.rows, now.total, action.focus, true)
+  else if ('dir' in action) await toggleDir($, action.dir)
+}
+
+/**
+ * A row pressed in the side view, by a click or Enter on the ring: the cursor
+ * moves there and the keys act on the tree. Pressed where the cursor already
+ * is, a file goes to the diff and a directory folds or opens.
+ */
+const pressRow = async ($: Dollar, key: string) => {
+  const [now, region] = await Promise.all([sideNow($), read($, regionAtom)])
+  const row = now.rows.find(one => one.key === key)
+  if (row === undefined) return
+  if (region === 'tree' && now.row?.key === key) {
+    if (row.kind === 'file') await toDiff($)
+    else await toggleDir($, row.path)
+    return
+  }
+  await putRegion($, 'tree')
+  await cursorTo($, now.rows, now.total, key, false)
+}
+
+/** A wheel tick over the regions: the one under the pointer moves its window; the cursor stays. */
+const wheel = async ($: Dollar, pointer: { column: number; row: number }, by: number) => {
+  const drawn = frame
+  if (drawn === undefined) return
+  const where = wheelRegion(drawn.layout, drawn.budget, pointer, await read($, regionAtom))
+  if (where === null) return
+  if (where === 'tree') {
+    const { total } = await listingNow($)
+    await putTreeOffset($, scrollBy(await read($, treeOffsetAtom), by, total, drawn.treeRows))
+    return
+  }
+  const { total } = bodyRows((await sideNow($)).body)
+  await putDiffOffset($, scrollBy(await read($, diffOffsetAtom), by, total, drawn.diffRows))
+}
+
 const runCommand = async ($: Dollar, args: string): Promise<string> => {
   const [sub = '', ...rest] = args.trim().split(/\s+/).filter(word => word !== '')
   switch (sub) {
@@ -887,6 +1315,18 @@ const runCommand = async ($: Dollar, args: string): Promise<string> => {
     default:
       return USAGE
   }
+}
+
+/** The side view's state, read while drawing: the pane draws again as it changes. */
+const readSide = async ($: Dollar): Promise<SideState> => {
+  const [cursor, region, diffOffset, treeOffset] = await Promise.all([
+    read($, cursorAtom),
+    read($, regionAtom),
+    read($, diffOffsetAtom),
+    read($, treeOffsetAtom),
+  ])
+
+  return { cursor, region, diffOffset, treeOffset }
 }
 
 export const register: Register = (on, options) => {
@@ -985,6 +1425,28 @@ export const register: Register = (on, options) => {
     return moved
   }).catch(($, e, next) => next(e))
 
+  // The side view draws its own windows into a pane that never overflows: a
+  // wheel over the regions moves the one under the pointer, not the body. The
+  // engine raises it at the body's edges too (d.ts), so with nothing for it to
+  // scroll as well. Its own scroll keys, a plugin's move, a wheel over the top
+  // or the hint, and any over a body too short to fit go on as they were.
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    const { pointer } = e
+    const drawn = frame
+    if (
+      config.diffView !== 'side' ||
+      e.origin.kind !== 'person' ||
+      pointer === undefined ||
+      drawn === undefined ||
+      wheelRegion(drawn.layout, drawn.budget, pointer, 'tree') === null
+    ) {
+      return next(e)
+    }
+    await inTurn(() => wheel($, pointer, e.by))
+
+    return {}
+  }).catch(($, e, next) => next(e))
+
   // Drawn on every terminal screen, so it says early whether panes dock. With
   // statusLine on, the terminal's line ends with the totals; reading the
   // snapshot here redraws it when the snapshot changes.
@@ -1002,7 +1464,8 @@ export const register: Register = (on, options) => {
     const ui: Ui = $.ui.resolve(e)
     learnLayout($, e.viewport?.isFullscreen)
     startPolling($)
-    const [snapshot, mode, expanded, diffs, isRefreshing, view, collapsedDirs] = await Promise.all([
+    const isSide = config.diffView === 'side'
+    const [snapshot, mode, expanded, diffs, isRefreshing, view, collapsedDirs, side] = await Promise.all([
       read($, snapshotAtom),
       read($, modeAtom),
       read($, expandedAtom),
@@ -1010,12 +1473,19 @@ export const register: Register = (on, options) => {
       read($, refreshingAtom),
       read($, viewAtom),
       read($, collapsedAtom),
+      isSide ? readSide($) : undefined,
     ])
     const tree = view === 'tree' && snapshot?.isRepo === true ? buildTree(snapshot.files) : null
     const rows = listedRows(snapshot, tree, collapsedDirs)
-    const autoFocus = ringStart(rows.map(row => navRow(row).key))
+    const columns = Math.max(16, e.props.bodyColumns)
+    // The side view's ring starts on the cursor's row, or on h's while the diff alone shows.
+    const autoFocus =
+      side === undefined
+        ? ringStart(rows.map(row => navRow(row).key))
+        : sideRing(paneLayout(columns), side.region, keptCursor([], rows.map(navRow), side.cursor))
+    let drawn: Frame | undefined
 
-    return drawPane(ui, {
+    const pane = drawPane(ui, {
       snapshot,
       tree,
       rows,
@@ -1023,14 +1493,16 @@ export const register: Register = (on, options) => {
       isFocused: e.props.isFocused,
       bodyRows: e.props.scroll.bodyRows,
       mode,
-      expanded,
+      // Files opened in the inline view stay closed here: nothing for x to collapse.
+      expanded: side === undefined ? expanded : [],
       diffs,
       isRefreshing,
       view,
       collapsedDirs,
-      columns: Math.max(16, e.props.bodyColumns),
+      columns,
       surface: e.surface,
       diffStyle: config.diffStyle,
+      side,
       onMode: picked => background(setMode($, picked)),
       onRefresh: () => background(refresh($, { force: true, isVisible: true })),
       onCollapse: () => background(collapseAll($)),
@@ -1039,7 +1511,16 @@ export const register: Register = (on, options) => {
       onDir: path => background(toggleDir($, path)),
       onFold: () => background(foldAll($)),
       onNav: key => background(inTurn(() => pressNav($, key))),
+      onSide: key => background(inTurn(() => pressSide($, key))),
+      onRow: key => background(inTurn(() => pressRow($, key))),
+      onFrame: regions => {
+        drawn = regions
+      },
     })
+    // A drawing without the regions (reading git, a notice) leaves none for the wheel to move.
+    if (isSide) frame = drawn
+
+    return pane
   })
 }
 
@@ -1067,6 +1548,8 @@ type PaneModel = {
   columns: number
   surface: RenderSurface
   diffStyle: DiffStyle
+  /** diffView side: the cursor and the regions' windows; absent, the inline view. */
+  side?: SideState
   onMode: (mode: DiffMode) => void
   onRefresh: () => void
   onCollapse: () => void
@@ -1075,6 +1558,11 @@ type PaneModel = {
   onDir: (path: string) => void
   onFold: () => void
   onNav: (key: NavKey) => void
+  onSide: (key: SideKey) => void
+  /** A row pressed in the side view, by its key. */
+  onRow: (key: string) => void
+  /** Told the regions' geometry as drawn, for the keys and the wheel. */
+  onFrame: (frame: Frame) => void
 }
 
 const navRow = (row: ListRow): NavRow =>
@@ -1123,6 +1611,9 @@ const keysRows = (model: PaneModel): number => {
  */
 const drawKeys = (ui: Ui, model: PaneModel, isTop: boolean): RenderElement | null => {
   const { Box, Button, Text } = ui
+  if (model.side !== undefined && model.isFocused) {
+    return <Box marginTop={1}>{drawSideKeys(ui, model, model.side, false)}</Box>
+  }
   if (model.isFocused) {
     return (
       <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={isTop ? 0 : 1} marginBottom={isTop ? 1 : 0}>
@@ -1497,11 +1988,15 @@ type Place = { depth: number; name: string }
 const dirOf = (path: string): string => path.slice(0, path.lastIndexOf('/') + 1)
 const isSameDir = (a: string, b: string): boolean => dirOf(a) === dirOf(b)
 
+/** The side view's cursor mark at the start of a row, and whether the row is the cursor's. */
+type RowMark = { mark: RenderElement; isCursor: boolean }
+
 const drawRow = (
   ui: Ui,
   model: PaneModel,
   file: FileChange,
   place?: Place,
+  marked?: RowMark,
 ): { node: RenderElement; nameCol: number } => {
   const { Button, Text } = ui
   // The snapshot's own mode: a switch shows the old rows until git answers.
@@ -1537,7 +2032,11 @@ const drawRow = (
   const label: (string | RenderElement)[] = []
   if (slash > 0) label.push(<Text dimColor>{name.slice(0, slash)}</Text>)
   label.push(
-    model.expanded.includes(file.path) ? <Text weight="semibold">{name.slice(slash)}</Text> : name.slice(slash),
+    model.expanded.includes(file.path) || marked?.isCursor === true ? (
+      <Text weight="semibold">{name.slice(slash)}</Text>
+    ) : (
+      name.slice(slash)
+    ),
   )
 
   const key = `file:${file.path}`
@@ -1545,6 +2044,7 @@ const drawRow = (
     ui,
     key,
     [
+      ...(marked !== undefined ? [marked.mark] : []),
       <Text>{lead}</Text>,
       <Button key={key} plain onPress={() => model.onToggle(file.path)} {...autoFocusOn(model, key)}>
         {label}
@@ -1557,7 +2057,14 @@ const drawRow = (
   return { node: indented(ui, model, cells, key, row), nameCol: cells + own }
 }
 
-const drawDirRow = (ui: Ui, model: PaneModel, dir: TreeDir, depth: number, isCollapsed: boolean): RenderElement => {
+const drawDirRow = (
+  ui: Ui,
+  model: PaneModel,
+  dir: TreeDir,
+  depth: number,
+  isCollapsed: boolean,
+  marked?: RowMark,
+): RenderElement => {
   const { Button, Text } = ui
   // An open directory's files say their own counts; a folded one sums them.
   const counts: Counts = {}
@@ -1573,12 +2080,13 @@ const drawDirRow = (ui: Ui, model: PaneModel, dir: TreeDir, depth: number, isCol
   const indent = indentText(model, cells)
 
   const key = `dir:${dir.path}`
-  const left: RenderElement[] = []
+  const left: RenderElement[] = marked !== undefined ? [marked.mark] : []
   if (indent !== '') left.push(<Text>{indent}</Text>)
+  const name = `${fitPath(oneLine(dir.name), room)}/`
   left.push(
     <Button key={key} plain onPress={() => model.onDir(dir.path)} {...autoFocusOn(model, key)}>
       <Text dimColor>{isCollapsed ? '▸ ' : '▾ '}</Text>
-      {`${fitPath(oneLine(dir.name), room)}/`}
+      {marked?.isCursor === true ? <Text weight="semibold">{name}</Text> : name}
     </Button>,
   )
   if (count !== '') left.push(<Text dimColor>{count}</Text>)
@@ -1770,6 +2278,8 @@ export const drawPane = (ui: Ui, model: PaneModel): RenderElement => {
     )
   }
 
+  if (model.side !== undefined) return drawSide(ui, model, model.side, snapshot)
+
   const body: RenderElement[] = drawHeader(ui, model, snapshot)
   // Roughly the rows drawn: whether the keys still show at the end.
   let height = body.length
@@ -1858,4 +2368,363 @@ export const drawPane = (ui: Ui, model: PaneModel): RenderElement => {
   }
 
   return finish()
+}
+
+// ------------------------------------------------------- side view drawing
+
+/** The side view's cursor mark and the space it leaves on every other row. */
+const MARK_CELLS = 2
+const SEPARATOR = '│'
+/** The blank cell between the rule and each region's rows. */
+const RULE_GAP = 1
+const REGION_LABEL: Record<Region, string> = { tree: ' tree ', diff: ' diff ' }
+
+/** Rows the hint row takes: the keys while the pane holds the keyboard, else on the terminal how to give it. */
+const sideHintRows = (model: PaneModel): number => (model.isFocused || model.surface === 'terminal' ? 1 : 0)
+
+/**
+ * The region's keys as Buttons, dim, in the order SIDE_KEYS gives; `isClipped`:
+ * one row, the ones past its end cut off but still pressed by their letters.
+ */
+const drawSideKeys = (ui: Ui, model: PaneModel, side: SideState, isClipped: boolean): RenderElement => {
+  const { Box, Button } = ui
+  const clip = isClipped ? { height: 1, overflow: 'hidden' as const } : {}
+
+  return (
+    <Box flexDirection="row" flexWrap="wrap" columnGap={2} {...clip}>
+      {SIDE_KEYS[side.region].map(({ hotkey, label }) => (
+        <Button
+          key={`nav:${hotkey}`}
+          label={label}
+          hotkey={hotkey}
+          plain
+          dimColor
+          onPress={() => model.onSide(hotkey)}
+          {...autoFocusOn(model, `nav:${hotkey}`)}
+        />
+      ))}
+    </Box>
+  )
+}
+
+/** A region's head: accented while the keys act on it, dim otherwise. */
+const drawRegionHead = (ui: Ui, region: Region, side: SideState): RenderElement => {
+  const { Text } = ui
+
+  return side.region === region ? (
+    <Text color="suggestion" weight="semibold">
+      {REGION_LABEL[region]}
+    </Text>
+  ) : (
+    <Text dimColor>{REGION_LABEL[region]}</Text>
+  )
+}
+
+/** Counts of files that are not binary, summed. */
+const sumCounts = (files: readonly FileChange[]): Counts => {
+  let added = 0
+  let removed = 0
+  for (const file of files) {
+    if (file.isBinary) continue
+    added += file.added
+    removed += file.removed
+  }
+  const counts: Counts = {}
+  if (added > 0) counts.added = `+${added}`
+  if (removed > 0) counts.removed = `${MINUS}${removed}`
+
+  return counts
+}
+
+/**
+ * What the diff region shows, in `cells` after its head: a file's status and
+ * path, a directory's path and how many files, the counts at the right edge.
+ */
+const drawDiffTitle = (ui: Ui, snapshot: Snapshot, body: SideBody, row: NavRow | undefined, cells: number): RenderElement[] => {
+  const { Text } = ui
+  if (row === undefined || cells < 1 + NAME_MIN) return []
+  if (body.kind === 'dir') {
+    const counts = sumCounts(body.files)
+    const tail = countsWidth(counts) > 0 ? countsWidth(counts) + 1 : 0
+    const hasCounts = tail > 0 && cells - 2 - tail >= NAME_MIN
+    const room = cells - 2 - (hasCounts ? tail : 0)
+    // How many files gives way before the name does.
+    const many = ` · ${body.files.length} ${body.files.length === 1 ? 'file' : 'files'}`
+    const hasMany = room - many.length >= NAME_MIN
+    const left = (
+      <Text wrap="truncate-end">
+        {' '}
+        <Text weight="semibold">{`${fitPath(oneLine(row.path), Math.max(1, hasMany ? room - many.length : room))}/`}</Text>
+        {hasMany ? <Text dimColor>{many}</Text> : null}
+      </Text>
+    )
+    return hasCounts ? [left, drawCounts(ui, counts)] : [left]
+  }
+  const file = snapshot.files.find(one => one.path === row.path)
+  if (file === undefined) return []
+  const counts = countParts(file)
+  const tail = countsWidth(counts) > 0 ? countsWidth(counts) + 1 : 0
+  const hasCounts = tail > 0 && cells - 3 - tail >= NAME_MIN
+  const room = Math.max(1, cells - 3 - (hasCounts ? tail : 0))
+  const color = STATUS_COLOR[file.status]
+  const left = (
+    <Text wrap="truncate-end">
+      {' '}
+      {color !== undefined ? <Text color={color}>{file.status}</Text> : <Text dimColor>{file.status}</Text>}{' '}
+      <Text weight="semibold">{fitPath(oneLine(file.path), room)}</Text>
+    </Text>
+  )
+
+  return hasCounts ? [left, drawCounts(ui, counts)] : [left]
+}
+
+/** One row of a region: what it is at the left, the rest pushed to the right edge. */
+const spread = (ui: Ui, parts: readonly RenderElement[]): RenderElement => {
+  const { Box } = ui
+  const [left, ...right] = parts
+
+  return (
+    <Box flexDirection="row" justifyContent="space-between">
+      <Box flexDirection="row">{left}</Box>
+      {right}
+    </Box>
+  )
+}
+
+/** The listing's rows the tree's window shows, the cursor's marked; `… N more files` after the last. */
+const drawTreeRegion = (
+  ui: Ui,
+  model: PaneModel,
+  side: SideState,
+  at: number,
+  cells: number,
+  rows: number,
+): RenderElement[] => {
+  const { Text } = ui
+  const omitted = model.snapshot?.omittedFiles ?? 0
+  const total = model.rows.length + (model.rows.length > 0 && omitted > 0 ? 1 : 0)
+  const from = clampOffset(side.treeOffset, total, rows)
+  // Each row as v0.3 draws it, in the cells the mark leaves; a press reaches the side view.
+  const inner: PaneModel = {
+    ...model,
+    columns: Math.max(1, cells - MARK_CELLS),
+    expanded: [],
+    onToggle: path => model.onRow(`file:${path}`),
+    onDir: path => model.onRow(`dir:${path}`),
+  }
+  const out: RenderElement[] = []
+  for (let index = from; index < Math.min(total, from + rows); index++) {
+    const row = model.rows[index]
+    if (row === undefined) {
+      out.push(<Text dimColor wrap="truncate-end">{`  … ${omitted} more files`}</Text>)
+      continue
+    }
+    const isCursor = index === at
+    const marked: RowMark = { mark: isCursor ? <Text color="suggestion">{'› '}</Text> : <Text>{'  '}</Text>, isCursor }
+    out.push(
+      row.kind === 'dir'
+        ? drawDirRow(ui, inner, row.dir, row.depth, row.isCollapsed, marked)
+        : drawRow(ui, inner, row.file, 'name' in row ? row : undefined, marked).node,
+    )
+  }
+
+  return out
+}
+
+/** The rows of `body` the diff's window shows, each cut at `cells`. */
+const drawDiffRegion = (
+  ui: Ui,
+  model: PaneModel,
+  side: SideState,
+  body: SideBody,
+  cells: number,
+  rows: number,
+): RenderElement[] => {
+  const { Code, Text } = ui
+  const { total } = bodyRows(body)
+  const from = clampOffset(side.diffOffset, total, rows)
+  const end = Math.min(total, from + rows)
+  const more = (count: number, text: string | null) =>
+    text !== null && end > count ? [<Text dimColor wrap="truncate-end">{clip(text, cells)}</Text>] : []
+
+  switch (body.kind) {
+    case 'none':
+      return []
+    case 'note':
+      return [
+        body.isError ? (
+          <Text color="error" wrap="truncate-end">
+            {clip(body.text, cells)}
+          </Text>
+        ) : (
+          <Text dimColor wrap="truncate-end">
+            {clip(body.text, cells)}
+          </Text>
+        ),
+      ]
+    case 'dir':
+      return body.files.slice(from, end).map(file => {
+        const counts = countParts(file)
+        const tail = countsWidth(counts) > 0 ? countsWidth(counts) + 1 : 0
+        const name = fitPath(oneLine(file.path.slice(body.path.length + 1)), Math.max(NAME_MIN, cells - 2 - tail))
+        const color = STATUS_COLOR[file.status]
+        return spread(ui, [
+          <Text wrap="truncate-end">
+            {color !== undefined ? <Text color={color}>{file.status}</Text> : <Text dimColor>{file.status}</Text>}
+            {` ${name}`}
+          </Text>,
+          ...(tail > 0 ? [drawCounts(ui, counts)] : []),
+        ])
+      })
+    case 'source': {
+      const shown = body.lines.slice(from, end)
+      return [
+        ...(shown.length > 0
+          ? [<Code format="source" source={shown.join('\n')} path={oneLine(body.path)} startLine={from + 1} wrap="truncate-end" />]
+          : []),
+        ...more(body.lines.length, body.more),
+      ]
+    }
+    case 'lines': {
+      const count = Math.max(0, Math.min(end, body.diff.lines.length) - from)
+      const nodes: RenderElement[] = []
+      if (count > 0) {
+        // The engine's view of the window's own hunks; one it cannot make draws quiet.
+        const hunks = model.diffStyle === 'engine' ? windowHunks(body.diff, from, count) : null
+        if (hunks !== null) {
+          nodes.push(<Code format="diff" source={printable(hunks)} path={oneLine(body.path)} wrap="truncate-end" />)
+        } else nodes.push(...drawLines(ui, body.diff.lines.slice(from, from + count), cells).nodes)
+      }
+      return [...nodes, ...more(body.diff.lines.length, body.more)]
+    }
+  }
+}
+
+/**
+ * The tree and the diff: side by side from SPLIT_MIN_COLUMNS, a dim rule
+ * between them, or one at a time. `height` rows exactly, the first the
+ * heads; each region draws only the rows its window shows.
+ */
+const drawRegions = (ui: Ui, model: PaneModel, side: SideState, snapshot: Snapshot, budget: RowBudget): RenderElement => {
+  const { Box, Text } = ui
+  const { region: height, content } = budget
+  const layout = paneLayout(model.columns)
+  model.onFrame({ layout, budget, treeRows: content, diffRows: content })
+  const rows = model.rows.map(navRow)
+  const at = cursorAt(rows, side.cursor)
+  const row = rows[at]
+  const body = sideBody(snapshot, row, row?.kind === 'file' ? model.diffs[row.path] : undefined)
+  // Side by side, a blank cell on each side of the rule keeps the counts and the diff's marks off it.
+  const isSplit = layout.kind === 'split'
+  const treeCells = isSplit ? layout.tree - RULE_GAP : layout.width
+  const diffCells = isSplit ? layout.diff - RULE_GAP : layout.width
+  const tree = (
+    <Box key="side:tree" flexDirection="column" paddingRight={isSplit ? RULE_GAP : 0}>
+      {drawTreeRegion(ui, model, side, at, treeCells, content)}
+    </Box>
+  )
+  const diff = (
+    <Box key="side:diff" flexDirection="column" paddingLeft={isSplit ? RULE_GAP : 0}>
+      {drawDiffRegion(ui, model, side, body, diffCells, content)}
+    </Box>
+  )
+  const label = REGION_LABEL.diff.length
+
+  if (layout.kind === 'split') {
+    const title = drawDiffTitle(ui, snapshot, body, row, layout.diff - label)
+    return (
+      <Box flexDirection="row" height={height} overflow="hidden">
+        <Box flexDirection="column" width={layout.tree} flexShrink={0} height={height} overflow="hidden">
+          {drawRegionHead(ui, 'tree', side)}
+          {tree}
+        </Box>
+        <Box flexDirection="column" width={layout.separator} flexShrink={0}>
+          <Text dimColor>{Array<string>(height).fill(SEPARATOR).join('\n')}</Text>
+        </Box>
+        <Box flexDirection="column" width={layout.diff} flexShrink={0} height={height} overflow="hidden">
+          {spread(ui, [
+            <Box flexDirection="row">
+              {drawRegionHead(ui, 'diff', side)}
+              {title[0] ?? null}
+            </Box>,
+            ...title.slice(1),
+          ])}
+          {diff}
+        </Box>
+      </Box>
+    )
+  }
+
+  // One region: both heads, the shown one accented; the diff's says what it shows.
+  const title = side.region === 'diff' ? drawDiffTitle(ui, snapshot, body, row, layout.width - 2 * label) : []
+
+  return (
+    <Box flexDirection="column" height={height} overflow="hidden">
+      {spread(ui, [
+        <Box flexDirection="row">
+          {drawRegionHead(ui, 'tree', side)}
+          {drawRegionHead(ui, 'diff', side)}
+          {title[0] ?? null}
+        </Box>,
+        ...title.slice(1),
+      ])}
+      {side.region === 'tree' ? tree : diff}
+    </Box>
+  )
+}
+
+/**
+ * The side view: v0.3's header, actions, tabs and summary on top, the
+ * regions under them, the keys on the last row. As tall as the body exactly,
+ * so the engine has nothing to scroll and each region keeps its own window.
+ */
+const drawSide = (ui: Ui, model: PaneModel, side: SideState, snapshot: Snapshot): RenderElement => {
+  const { Box, Text } = ui
+  const { tree } = model
+  const top: RenderElement[] = drawHeader(ui, model, snapshot)
+  let topRows = top.length
+  if (snapshot.head !== '') {
+    top.push(drawActions(ui, model, tree, true), drawTabs(ui, model))
+    topRows += actionsRows(model, tree) + 1 + wrappedRows(MODES.map(tabCells), TAB_GAP, model.columns)
+    const rule = drawRule(ui, model)
+    if (rule !== null) {
+      top.push(rule)
+      topRows += 1
+    }
+  }
+  const notice = noticeOf(snapshot)
+  const isListed = isListedOf(snapshot, notice)
+  if (notice === null) {
+    top.push(drawSummary(ui, model, snapshot))
+    topRows += 1
+  } else if (isListed) {
+    top.push(drawNotice(ui, notice, true))
+    topRows += noticeRows(notice, true, model.columns)
+  }
+  const hint = sideHintRows(model)
+  const budget = rowBudget(model.bodyRows, topRows, hint)
+
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="column" height={budget.top} overflow="hidden">
+        {top}
+      </Box>
+      {isListed || notice === null ? (
+        drawRegions(ui, model, side, snapshot, budget)
+      ) : (
+        <Box flexDirection="column" height={budget.region} overflow="hidden">
+          {drawNotice(ui, notice, false)}
+        </Box>
+      )}
+      {hint === 0 ? null : model.isFocused ? (
+        drawSideKeys(ui, model, side, true)
+      ) : (
+        <Box height={1} overflow="hidden">
+          <Text dimColor wrap="truncate-end">
+            {FOCUS_HINT}
+          </Text>
+        </Box>
+      )}
+    </Box>
+  )
 }

@@ -83,6 +83,14 @@ declare module 'claude-code' {
       view: ViewMode
       /** Paths of the tree's collapsed directories. */
       collapsedDirs: Shaped<string[]>
+      /** diffView side: the row key (`file:<path>`, `dir:<path>`) the cursor is on; null before the first listing. */
+      cursor: Shaped<string | null>
+      /** diffView side: which region the keys act on. */
+      region: Shaped<'tree' | 'diff'>
+      /** diffView side: the first row of the diff the diff region shows. */
+      diffOffset: Shaped<number>
+      /** diffView side: the first row of the listing the tree region shows. */
+      treeOffset: Shaped<number>
     }
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "worktree-diff",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A side pane showing what the current git worktree changed versus the branch it came from",
   "author": { "name": "sudoviber", "url": "https://github.com/sudoviber" },
   "license": "MIT",
@@ -33,6 +33,13 @@
       "description": "quiet: changed lines in green and red text, no background; engine: Claude Code's own diff view, with syntax colours and line numbers",
       "default": "quiet",
       "options": ["quiet", "engine"]
+    },
+    "diffView": {
+      "type": "string",
+      "title": "Where a file's diff shows",
+      "description": "side: the diff of the file under the cursor in a region of its own, beside the tree (w switches between them); inline: under its row, opened with enter",
+      "default": "side",
+      "options": ["side", "inline"]
     },
     "paneBackground": {
       "type": "string",

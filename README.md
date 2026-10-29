@@ -4,34 +4,28 @@ English | [简体中文](README.zh-CN.md)
 
 A Claude Code mod that docks a **Changes** pane beside the conversation. It shows what the
 current git worktree changed compared with the branch it was created from: every file with
-its added and removed line counts, and the unified diff of any file you open. The pane
-refreshes itself after Claude edits files or runs commands, so you can follow the branch's
-changes without switching to another tool.
+its added and removed line counts in a tree on the left, and the diff of the file under the
+cursor in a region of its own on the right. The pane refreshes itself after Claude edits files
+or runs commands, so you can follow the branch's changes without switching to another tool.
 
 ```
-feat/login                           ↑3 ↓1
-vs main                   reflog · a1b2c3d
-r: refresh  t: list  z: fold  x: collapse
+feat/login                                                                       ↑3 ↓1
+vs main                                                               reflog · a1b2c3d
+r: refresh  t: list  z: fold
 
 a: all   c: committed   u: uncommitted
-━━━━━━────────────────────────────────────
-5 files  ● 2                        +9 −14
-▾ src/
-  M ● app.ts                         +1 −1
-      @@ 14  export function start() {
-        const port = readPort()
-      - listen(3000)
-      + listen(port)
-        log('ready')
-
-  A   new.ts                            +2
-      1 export const greet = (name) =>
-      2   `Hello, ${name}`
-
-  R   main.ts ← index.ts             +1 −1
-
-? ● notes.md                            +5
-D   old.txt                            −12
+━━━━━━────────────────────────────────────────────────────────────────────────────────
+5 files  ● 2 uncommitted                                                       +10 −15
+ tree                            │ diff  M src/app.ts                            +2 −2
+  ▾ src/                         │ @@ 14  export function start() {
+›   M ● app.ts             +2 −2 │   const port = readPort()
+    A   new.ts                +2 │ - listen(3000)
+    R   main.ts ← index.ts +1 −1 │ + listen(port)
+  ? ● notes.md                +5 │   log('ready')
+  D   old.txt                −12 │ @@ 31  export function stop() {
+                                 │ - server.close()
+                                 │ + server?.close()
+j: down  k: up  l: open  w: diff  h: fold  q: close  d: page  b: back  g: top  e: end
 ```
 
 The header names the branch, how far it is ahead of its base (↑) and behind it (↓), and the
@@ -39,21 +33,56 @@ base it is compared with. Under the actions, the line beneath the mode tabs mark
 mode, and the row after it sums up that mode's listing.
 
 Files are shown as a tree of folders by default. A chain of folders that each hold only one
-folder is drawn as one row (`src/app/api/`). Press a folder row to fold it; a folded folder
-says how many files it holds and adds up the lines changed below it. A renamed file sits
-under its new path, with its old name after `←`, or its old path if it moved from another
-folder. The flat list always gives the old path.
+folder is drawn as one row (`src/app/api/`). A folded folder says how many files it holds and
+adds up the lines changed below it. A renamed file sits under its new path, with its old name
+after `←`, or its old path if it moved from another folder. The flat list always gives the old
+path. `●` marks a file that has changes not committed yet. On a narrow pane long names are
+shortened in the middle.
 
-`●` marks a file that has changes not committed yet. Press a file's name to open its diff and
-press it again to close it. On a narrow pane long names are shortened in the middle.
+### The tree and the diff
 
-An open diff lines up under the file's name. A changed file's lines are drawn in color with no
-background: added lines in green after `+`, removed lines in red after `-`, unchanged lines dim.
-Each hunk starts with `@@`, the line number it starts at in the new file, and the function it
-is in when git names one. A hunk that leaves no lines in the new file gives its line number in
-the old file instead, as `@@ −1`. A new or untracked file is shown as source, with syntax colors and
-line numbers. A deleted file gets one line that says how many lines it had. To use Claude
-Code's own diff view instead, set `diffStyle` to `engine`.
+The pane is split into a fixed top (the header, actions, mode tabs and summary), the two
+regions under it, and a row of keys at the bottom. Together they are exactly as tall as the
+pane, so the pane itself never scrolls: the tree and the diff each scroll on their own.
+
+- **Side by side**, once the pane is 80 columns wide or more: the tree on the left (38% of the
+  width, 28 to 48 columns), a dim `│`, and the diff in the rest.
+- **One at a time** on a narrower pane: the tree or the diff fills the width, and the head row
+  names both, the one shown highlighted:
+
+  ```
+   tree  diff  M src/app.ts                    +2 −2
+  ```
+
+The cursor, `›` with the name in bold, is the tree's selected row. The diff region always
+shows what is under it, and follows it as it moves: the cursor stands still for 120 ms before
+a file's diff is read, so holding `j` down reads only the file it stops on. The last 16 files
+read are kept, so going back to one shows it at once while it is read again, in case it changed;
+a refresh reads the file under the cursor again. Moving the cursor to another row, switching
+modes or changing the base starts the diff at the top.
+
+The keys act on one region at a time, and its head (` tree ` or ` diff `) is highlighted.
+`w` switches between them. In the tree, `l` (or `Enter`) on a file goes to the diff; in the
+diff, `h` goes back to the tree.
+
+What the diff region shows, under a head row with the file's status, path and counts:
+
+- A changed file: its lines in color with no background, added lines in green after `+`,
+  removed lines in red after `-`, unchanged lines dim. Each hunk starts with `@@`, the line
+  number it starts at in the new file, and the function it is in when git names one. A hunk
+  that leaves no lines in the new file gives its line number in the old file instead, as
+  `@@ −1`. To use Claude Code's own diff view instead, set `diffStyle` to `engine`.
+- A new or untracked file: its source, with syntax colors and line numbers.
+- A folder: the files under it, each with its status and counts; the head gives the folder's
+  path, how many files it holds and their totals.
+- A deleted file: one line that says how many lines it had. A binary file, a file with no
+  textual changes, a diff still being read and a diff that failed each get one line too.
+
+If a refresh drops the row the cursor is on, the cursor moves to the nearest row left, below it
+first. If a fold hides it, it moves to the folder that hides it.
+
+To open diffs under their rows in the list instead, as before version 0.4, set `diffView` to
+`inline` (see [Inline view](#inline-view)).
 
 ## Install
 
@@ -106,31 +135,69 @@ Keys reach the pane only while it has the keyboard; otherwise they go to the pro
 it is right after a command), and so do ctrl+x tab and a click on the pane. Esc gives the
 keyboard back to the prompt and leaves the pane open.
 
+| Key | In the tree | In the diff |
+|---|---|---|
+| `j` / `k` | Move the cursor to the next / previous row (a file or a folder); the tree scrolls to keep it in view and the diff follows it | Scroll down / up a line |
+| `d` / `b` | Move the cursor half a region down / up | Scroll half a region down / up |
+| `n` / `p` | — | Go to the next / previous hunk |
+| `g` / `e` | Go to the first / last row | Go to the top / bottom (`e` for end: keys are read lowercase, so `G` acts as `g`) |
+| `l` | On a file, go to the diff. On a folded folder, unfold it; on an open folder, go to its first row | — |
+| `h` | Fold an open folder; on a file or a folded folder, go to the folder above it | Go back to the tree |
+| `w` | Go to the diff | Go back to the tree |
+| `Enter` | Press the row the focus is on, as a click does: on the cursor's row, a file goes to the diff and a folder folds or unfolds | Go back to the tree |
+| `q` | Close the pane (ctrl+x x closes it too) | Same |
+| `a` / `c` / `u` | Switch the mode | Same |
+| `r` | Refresh | Same |
+| `t` | Switch between the tree and a flat list (the choice is kept across sessions) | Same |
+| `z` | Fold every folder, or unfold them all again | Same |
+| `Tab` | Move between the rows and the buttons | Same |
+| `Esc` | Give the keyboard back to the prompt | Same |
+
+Half a region up is `b` (back), not `u`, because `u` stays the **uncommitted** tab.
+
+The focus ring stays on the cursor's row, so `Enter` presses it. When the pane takes the
+keyboard, the focus starts there, or on the first row. With one region shown and that the
+diff, the ring waits on the `h` key at the bottom instead, so `Enter` goes back to the tree
+there too.
+
+The bottom row lists the keys of the region the keys act on, each with what a press does
+(`w: diff` in the tree, `w: tree` in the diff). It is one row high: on a narrow pane the keys
+past its end are cut off, but they still work. Without the keyboard, the terminal shows
+`ctrl+x tab to focus` there instead. Each button at the top also shows its key next to its
+name, named for what a press does (`t: list` in the tree, `t: tree` in the list).
+
+### Mouse
+
+- A click on a row of the tree moves the cursor there, and the keys act on the tree. A click
+  on the row the cursor is already on, while the keys act on the tree, presses it: a file goes
+  to the diff, a folder folds or unfolds.
+- The wheel scrolls the region under the pointer: over the tree, the tree's rows (the cursor
+  stays where it is, even out of view, and refreshes leave the tree where it is, until the next
+  key brings the cursor back); over the `│` or the diff, the diff.
+
+### Inline view
+
+With `diffView` set to `inline` the pane works as it did before version 0.4: there is no diff
+region, and a file's diff opens under its row in the list, lined up under the file's name. It
+is drawn as the diff region draws it. The keys are:
+
 | Key | What it does |
 |---|---|
 | `j` / `k` | Move to the next / previous row (a file or a folder) and scroll it into view. From no row, `j` goes to the first row and `k` to the last |
 | `Enter` | Press the row: open or close a file's diff, fold or unfold a folder |
 | `h` | Fold an open folder; on a file or a folded folder, go to the folder above it |
 | `l` | Unfold a folded folder or open a file's diff; on an open folder, go to its first row |
-| `g` / `e` | Go to the first / last row; `g` also scrolls the pane back to its top (`e` for end: keys are read lowercase, so `G` acts as `g` and goes to the top) |
-| `q` | Close the pane (ctrl+x x closes it too) |
-| `a` / `c` / `u` | Switch the mode |
-| `r` | Refresh |
-| `t` | Switch between the tree and a flat list (the choice is kept across sessions) |
-| `z` | Fold every folder, or unfold them all again |
+| `g` / `e` | Go to the first / last row; `g` also scrolls the pane back to its top |
 | `x` | Close every open diff |
-| `Tab` | Move between the rows and the buttons |
-| `Esc` | Give the keyboard back to the prompt |
 
-The arrow keys scroll the pane when its content is taller than the pane; `j` and `k` move
-between rows. When the pane takes the keyboard, the focus starts on the row it was last on, or
-on the first row.
+`q`, `a` / `c` / `u`, `r`, `t`, `z`, `Tab` and `Esc` do what they do in the tree above. A click
+on a file's name opens its diff and a second click closes it; a click on a folder row folds it.
 
-Each button shows its key next to its name, named for what a press does (`t: list` in the tree,
-`t: tree` in the list). While the pane has the keyboard it also lists `j` `k` `h` `l` `g` `e`
-`q` at its bottom, or under the buttons at the top when the listing is taller than the pane;
-there they show when the pane opens and scroll away with the rows, and `g` brings them back.
-Otherwise the terminal shows `ctrl+x tab to focus` there.
+The pane scrolls as a whole, with the arrow keys and the wheel, when its content is taller than
+the pane. When the pane takes the keyboard, the focus starts on the row it was last on, or on
+the first row. While the pane has the keyboard it lists `j` `k` `h` `l` `g` `e` `q` at its
+bottom, or under the buttons at the top when the listing is taller than the pane; there they
+show when the pane opens and scroll away with the rows, and `g` brings them back.
 
 ### Modes
 
@@ -214,6 +281,7 @@ Set these in the config menu (`/config`) or under `pluginConfigs` in settings:
 | `autoOpen` | `worktree` | `worktree`: open the pane when the session starts in, or enters, a linked worktree. `always`: in any git repository. `never`: only with `/wt-diff`. |
 | `pollSeconds` | `5` | How often the open pane re-reads git. `0` turns polling off. |
 | `statusLine` | `false` | Show the file count and line totals, such as `· 5 files +202 −34`, at the end of the hint line under the prompt. On a surface that does not draw that line, such as the desktop app, they appear in the status line instead; while the desktop app is attached, the terminal shows them in both places. |
+| `diffView` | `side` | `side`: the diff of the file under the cursor in a region of its own, beside the tree or, on a narrow pane, in its place. `inline`: a file's diff opens under its row in the list, as before version 0.4. |
 | `diffStyle` | `quiet` | `quiet`: a changed file's lines in green and red text, with no background. `engine`: Claude Code's own diff view, with syntax colors and line numbers. New files are shown as source either way. |
 | `paneBackground` | `transparent` | `transparent`: the pane draws no fill of its own, so your terminal's background (color, image or blur) shows through and the pane blends with the conversation. `theme`: Claude Code's own pane fill. |
 
@@ -222,6 +290,11 @@ fullscreen layout, once the terminal is 144 columns wide. Until it is that wide 
 not drawn and does not poll. On the main-screen layout (`CLAUDE_CODE_NO_FLICKER=0`, tmux by
 default) a pane would sit inline above the prompt, so nothing opens by itself there. `/wt-diff`
 opens it on any layout and at any width.
+
+With `diffView` set to `side`, the pane asks the dock to be 120 columns wide. Claude Code holds
+a docked pane to 45% of the terminal, so the tree and the diff sit side by side (80 columns of
+pane) once the terminal is about 178 columns wide; on a 200-column terminal the pane gets about
+90. A width you drag the dock to wins over the request. The inline view asks for no width.
 
 ## Limits
 
@@ -237,10 +310,17 @@ opens it on any layout and at any width.
 - Control characters in a diff or a path (an ANSI escape, a form feed) are drawn as `�`. In a
   changed file's lines a tab is drawn as spaces up to the next multiple of four columns, with a
   wide (CJK) character counting two.
-- A line of a diff wider than the pane is cut at the edge with `…`.
-- The pane's line-drawing glyphs (the `─━` rule under the tabs, `●`, `▾`, `↑↓`, `←`) are East Asian
-  Ambiguous width. A terminal set to draw ambiguous characters as wide gives each two cells, so
-  the rule wraps onto a second line and right-aligned counts shift.
+- A line of a diff wider than its region (or the pane, in the inline view) is cut at the edge
+  with `…`. There is no scrolling sideways.
+- Claude Code does not redraw a pane when only its height changes. After you make the terminal
+  taller or shorter, the regions keep their old height until something in the pane changes: a
+  key, a click, or a refresh that finds new changes.
+- A pane too short for the top, a region head, one row of each region and the key row draws
+  past its bottom; it then scrolls as a whole, and the wheel scrolls the whole pane.
+- The pane's line-drawing glyphs (the `─━` rule under the tabs, the `│` between the regions, `●`,
+  `↑↓`, `←`) are East Asian Ambiguous width. A terminal set to draw ambiguous characters as
+  wide gives each two cells, so the rule wraps onto a second line and right-aligned counts
+  shift.
 
 ## License
 
