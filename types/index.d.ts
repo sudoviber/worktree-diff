@@ -1,9 +1,12 @@
 export type DiffMode = 'all' | 'committed' | 'uncommitted'
 
+export type ViewMode = 'tree' | 'list'
+
 export type BaseSource =
   | 'override'
   | 'reflog'
   | 'upstream'
+  | 'trunk'
   | 'main-worktree'
   | 'default-branch'
 
@@ -37,6 +40,8 @@ export type Snapshot = {
   error?: string
   /** `git rev-parse --show-toplevel`, absolute. Empty when not a repo. */
   root: string
+  /** `git rev-parse --git-common-dir`, absolute: one per repository, shared by its worktrees. Empty when unknown. */
+  gitCommonDir: string
   isLinkedWorktree: boolean
   /** Current branch, or null when HEAD is detached. */
   branch: string | null
@@ -74,6 +79,10 @@ declare module 'claude-code' {
       expanded: Shaped<string[]>
       diffs: Shaped<Record<string, FileDiff>>
       isRefreshing: boolean
+      /** Mirrors `$.store`'s `view`, which keeps it across sessions, for drawing. */
+      view: ViewMode
+      /** Paths of the tree's collapsed directories. */
+      collapsedDirs: Shaped<string[]>
     }
   }
 }

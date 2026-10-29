@@ -8,17 +8,23 @@ changes without switching to another tool.
 
 ```
 feat/login → main
-↑3 ↓1 · 5 files · +120 −34  reflog · a1b2c3d
-a: all  c: committed  u: uncommitted  r: refresh
-M ● src/app.ts                +12 −3
-A   src/new.ts                   +40
-R   old.ts → new.ts            +1 −1
-? ● notes.md                      +5
+↑3 ↓1 · 4 files · +58 −4  reflog · a1b2c3d
+a: all  c: committed  u: uncommitted  r: refresh  t: list  z: fold
+▾ src/                          +53 −4
+  M ● app.ts                    +12 −3
+  A   new.ts                       +40
+  R   main.ts ← src/index.ts     +1 −1
+? ● notes.md                        +5
 ```
 
-`●` marks a file that has changes not committed yet. Press a row to open its diff and press
-it again to close it. On a narrow pane the branch name is shortened in the middle so the base
-it is compared with stays readable.
+Files are shown as a tree of folders by default. A chain of folders that each hold only one
+folder is drawn as one row (`src/app/api/`), and each folder row adds up the lines changed
+below it. Press a folder row to fold it; a folded folder also says how many files it holds.
+A renamed file sits under its new path, with the old path after `←`.
+
+`●` marks a file that has changes not committed yet. Press a file row to open its diff and
+press it again to close it. On a narrow pane the branch name is shortened in the middle so the
+base it is compared with stays readable.
 
 ## Install
 
@@ -37,6 +43,14 @@ claude plugin install worktree-diff --marketplace sudoviber/worktree-diff
 To run it from a local checkout for one session instead, use
 `claude --plugin-dir <path to this folder>`.
 
+To update an installed copy to the latest version, run this from a shell:
+
+```
+claude plugin update worktree-diff
+```
+
+Then run `/reload-plugins` in any open session to load the new version without restarting it.
+
 ## Usage
 
 | Command | What it does |
@@ -46,13 +60,18 @@ To run it from a local checkout for one session instead, use
 | `/wt-diff refresh` | Re-read git now |
 | `/wt-diff base <ref>` | Compare this worktree against `<ref>` from now on (kept across sessions) |
 | `/wt-diff base` | Forget that override and go back to the inferred base |
+| `/wt-diff trunk <ref>` | Name the repository's integration branch (for example `origin/feat/auth-ui`), shared by all its worktrees and kept across sessions |
+| `/wt-diff trunk` | Forget the integration branch |
 | `/wt-diff mode all\|committed\|uncommitted` | Choose what is compared |
 
 `/wt-diff` runs at once even while Claude is still working, so you can open the pane to watch
 edits as they land.
 
 Keys while the pane has the keyboard (ctrl+x tab, or a click): `a` / `c` / `u` switch the mode,
-`r` refreshes, `x` closes every open diff. The pane prints each key next to its button.
+`r` refreshes, `t` switches between the tree and a flat list (the choice is kept across
+sessions), `z` folds every folder or opens them all again, and `x` closes every open diff. The
+pane prints each key next to its button, named for what a press does (`t: list` in the tree,
+`t: tree` in the list). `/wt-diff status` always prints a flat list.
 
 ### Modes
 
@@ -69,7 +88,12 @@ branch is ahead of the base (↑) and behind it (↓).
 
 ### How the base branch is found
 
-The base is found by trying these in order. The pane header names the one that applied.
+The base is found by trying a list of sources in order, and the pane header names the one
+that applied. A linked worktree (one made with `git worktree add`) and the repository's main
+checkout use different lists, because the main checkout often sits on the integration branch
+itself.
+
+In a linked worktree:
 
 1. **override**: the ref set with `/wt-diff base <ref>` for this worktree.
 2. **reflog**: the branch's creation entry, `branch: Created from <ref>`, which
@@ -78,9 +102,29 @@ The base is found by trying these in order. The pane header names the one that a
    created from `HEAD` or from something that moves with it (`HEAD~2`, `@~1`, `@{-1}`,
    `FETCH_HEAD`, `ORIG_HEAD`), or from its own remote copy, skips this step.
 3. **upstream**: the branch's upstream, unless it is just the remote copy of the same branch.
-4. **main-worktree**: the branch checked out in the repository's main worktree.
-5. **default-branch**: `origin/HEAD`, then the first of `main`, `master`, `trunk` or `develop`
+4. **trunk**: the integration branch set with `/wt-diff trunk <ref>`, unless it is this branch
+   or its remote copy.
+5. **main-worktree**: the branch checked out in the repository's main worktree.
+6. **default-branch**: `origin/HEAD`, then the first of `main`, `master`, `trunk` or `develop`
    that exists.
+
+In the main checkout:
+
+1. **override**, as above.
+2. **reflog**, as above, with one addition: for a branch created from `HEAD` (`git checkout -b
+   feat` with no start point), the branch `HEAD` was on at that moment, read from `HEAD`'s own
+   reflog. This step is skipped while you are on the trunk itself.
+3. **trunk**, unless it is this branch or its remote copy.
+4. **upstream**: the branch's own upstream, even when it is the remote copy of the same branch.
+   The pane then shows what is not pushed yet plus what is not committed. This step is taken
+   only when the branch has no creation entry left (its reflog expired, or it came from a
+   clone), when the creation entry names its own remote copy, or when the branch is the trunk.
+5. **default-branch**, as above.
+
+So a main checkout that stays on the integration branch shows its unpushed work with no setup.
+If the inferred base is wrong, set the integration branch once with `/wt-diff trunk <ref>`, or
+set this worktree's base with `/wt-diff base <ref>`. The trunk must be a branch, tag or commit
+that names the same thing in every worktree, so `HEAD`, `@{u}` and `main~1` are refused.
 
 If none of these applies, the pane says so. You can still use **uncommitted** mode, or set a
 base with `/wt-diff base <ref>`.
