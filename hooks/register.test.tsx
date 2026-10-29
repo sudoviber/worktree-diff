@@ -1,7 +1,20 @@
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { On, RenderSurface } from 'claude-code'
 
-import { cellWidth, fitHeader, fitPath, oneLine, printable, readConfig, statusLineText, USAGE } from './register'
+import {
+  cellWidth,
+  fitPath,
+  FOCUSED,
+  focusRow,
+  inTurn,
+  navAction,
+  oneLine,
+  printable,
+  readConfig,
+  statusLineText,
+  USAGE,
+  type NavRow,
+} from './register'
 import type { RunResult } from './git'
 
 // Real git 2.54 output from the throwaway feat worktree git.test.ts describes:
@@ -85,7 +98,7 @@ const featFiles: Record<string, string> = {
 // Only a snapshot pass asks for the branch: one call per pass.
 const PASS_MARK = 'symbolic-ref --short -q HEAD'
 
-const PREFIX = ['git', '-c', 'core.quotePath=false', '-c', 'diff.suppressBlankEmpty=false', '--no-optional-locks']
+const PREFIX = ['git', '-c', 'core.quotePath=false', '-c', 'diff.suppressBlankEmpty=false', '-c', 'diff.context=3', '--no-optional-locks']
 
 /** The args after git's fixed prefix, diff's hardening flags dropped. */
 const keyOf = (argv: readonly string[]) => {
@@ -111,6 +124,8 @@ type World = {
   isShown?: boolean
   /** What `$.store` holds at the start. */
   store?: Record<string, unknown>
+  /** What `$.session.surfaces()` answers; the terminal alone by default. */
+  surfaces?: readonly RenderSurface[]
 }
 
 /** A promise a test settles by hand. */
@@ -143,8 +158,12 @@ const world = (on: On, given: World = {}) => {
     panesCalls: 0,
     inits: [] as unknown[],
     statuses: [] as (string | undefined)[],
+    surfaces: given.surfaces ?? (['terminal'] as readonly RenderSurface[]),
     opened: 0,
     openArgs: [] as unknown[],
+    /** Whether an open asking for the keyboard gets it: false as over text in the composer. */
+    grantsFocus: true,
+    isFocused: false,
   }
   const clock = mock.clock(on, { now: 1_000 })
   // As mock.store, but open to the test.
@@ -191,6 +210,10 @@ const world = (on: On, given: World = {}) => {
     return { value: { kind: 'file' as const, size: text.length, mtimeMs: 0, isLink } }
   })
   on('session.cwd', () => ({ value: state.cwd }))
+  on('session.surfaces', () => ({ value: state.surfaces }))
+  // The engine keeps the roster; a test sets state.surfaces itself.
+  on('session.attach', (_, e) => ({ clientId: e.clientId }))
+  on('session.detach', (_, e) => ({ clientId: e.clientId }))
   on('command.register', () => ({ value: { command: 'wt-diff' } }))
   on('ui.panes', () => {
     state.panesCalls += 1
@@ -201,7 +224,7 @@ const world = (on: On, given: World = {}) => {
               id: 'worktree-diff',
               title: 'Changes',
               isShown: state.isPlaced && state.isShown,
-              isFocused: false,
+              isFocused: state.isFocused,
               isPlaced: state.isPlaced,
             },
           ]
@@ -215,10 +238,12 @@ const world = (on: On, given: World = {}) => {
     state.isOpen = true
     state.isPlaced = true
     state.isShown = true
+    if (e.focus === true) state.isFocused = state.grantsFocus
     return { value: { isPlaced: true as const } }
   })
   on('ui.close', () => {
     state.isOpen = false
+    state.isFocused = false
     return { value: undefined }
   })
   on('ui.status', (_, e) => {
@@ -233,10 +258,12 @@ const world = (on: On, given: World = {}) => {
     return { result: {} }
   })
   on('turn.complete', () => ({ text: '' }))
-  // The engine's own hint line, which tells the mod how the screen is laid out.
+  // The person's move of the pane's ring, raised by a test, lands where it is asked.
+  on('ui.focus', () => ({}))
+  // The engine's own hint line, which tells the mod how the screen is laid out; a tail ends it.
   on('ui.render', { component: 'PromptHint' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
-    return <Text>{e.props.hint}</Text>
+    return <Text>{e.props.tail ? `${e.props.hint} ${e.props.tail}` : e.props.hint}</Text>
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
 
@@ -280,6 +307,194 @@ const wtDiff = ($: Engine, args = '') =>
     presentation: { isFullscreen: true, columns: 160 },
   })
 
+// ----------------------------------------------------------------- paint
+
+/** An element as `drawn()` and `find()` give it: plain data. */
+type Drawn = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+
+/** A Space in cells: across, or down. */
+const space = (value: unknown, isDown = false): number => {
+  if (typeof value === 'number') return value
+  const steps: Record<string, readonly [number, number]> = { xs: [1, 0], sm: [1, 0], md: [2, 1], lg: [3, 1], xl: [4, 2] }
+  return typeof value === 'string' ? (steps[value]?.[isDown ? 1 : 0] ?? 0) : 0
+}
+
+const textOf = (node: unknown): string => {
+  if (typeof node === 'string') return node
+  if (typeof node === 'number') return String(node)
+  if (node === null || typeof node !== 'object') return ''
+  return ((node as Drawn).children ?? []).map(textOf).join('')
+}
+
+/** As the terminal draws a Button: plain is `h: label`, else `[ label ]`. */
+const buttonText = (node: Drawn): string => {
+  const { label, hotkey, plain } = node.props ?? {}
+  const inner = (node.children ?? []).length > 0 ? textOf(node) : String(label ?? '')
+  if (plain !== true) return `[ ${inner} ]`
+  return typeof hotkey === 'string' ? `${hotkey}: ${inner}` : inner
+}
+
+/** Splits `text` after at most `cells` cells, whole code points. */
+const splitCells = (text: string, cells: number): [string, string] => {
+  let used = 0
+  let head = ''
+  for (const char of text) {
+    used += cellWidth(char)
+    if (used > cells) break
+    head += char
+  }
+  return [head, text.slice(head.length)]
+}
+
+const cutCells = (text: string, cells: number): string =>
+  cellWidth(text) <= cells ? text : `${splitCells(text, Math.max(0, cells - 1))[0]}…`
+
+const wrapCells = (text: string, cells: number): string[] => {
+  const lines: string[] = []
+  let rest = text
+  while (cellWidth(rest) > cells && cells > 0) {
+    const [head, tail] = splitCells(rest, cells)
+    lines.push(head)
+    rest = tail
+  }
+  return [...lines, rest]
+}
+
+const padCells = (text: string, cells: number): string => text + ' '.repeat(Math.max(0, cells - cellWidth(text)))
+
+/** A Code's line numbers, as wide as the last and a space; none without `startLine`. */
+const gutterOf = (props: Record<string, unknown>): number =>
+  typeof props.startLine === 'number' && props.format !== 'diff'
+    ? String(props.startLine + String(props.source).split('\n').length - 1).length + 1
+    : 0
+
+/** The cells a node takes on one row, nothing wrapped. */
+const natural = (node: unknown): number => {
+  if (typeof node === 'string') return cellWidth(node)
+  const { type, props = {}, children = [] } = node as Drawn
+  if (type === 'Text') return Math.max(...textOf(node).split('\n').map(cellWidth))
+  if (type === 'Button') return cellWidth(buttonText(node as Drawn))
+  if (type === 'Code') return gutterOf(props) + Math.max(...String(props.source).split('\n').map(cellWidth))
+  const pad = space(props.paddingLeft ?? props.paddingX ?? props.padding) + space(props.paddingRight ?? props.paddingX ?? props.padding)
+  const sizes = children.map(natural)
+  if (props.flexDirection === 'column') return Math.max(0, ...sizes) + pad
+  return sizes.reduce((sum, size) => sum + size, 0) + space(props.columnGap ?? props.gap) * Math.max(0, sizes.length - 1) + pad
+}
+
+/** A row Box's children: each at its own width, wrapped if it wraps, spread if it spreads; never shrunk. */
+const paintRow = (kids: unknown[], width: number, props: Record<string, unknown>): string[] => {
+  const gap = space(props.columnGap ?? props.gap)
+  const sizes = kids.map(natural)
+  const groups: number[][] = [[]]
+  let used = 0
+  sizes.forEach((size, index) => {
+    const group = groups[groups.length - 1] as number[]
+    if (props.flexWrap === 'wrap' && group.length > 0 && used + gap + size > width) {
+      groups.push([index])
+      used = size
+    } else {
+      used += (group.length > 0 ? gap : 0) + size
+      group.push(index)
+    }
+  })
+  return groups.flatMap(group => {
+    const total = group.reduce((sum, index) => sum + (sizes[index] ?? 0), 0) + gap * Math.max(0, group.length - 1)
+    const extra = props.justifyContent === 'space-between' && group.length > 1 ? Math.max(0, width - total) : 0
+    const blocks = group.map(index => paint(kids[index], sizes[index] ?? 0))
+    const height = Math.max(0, ...blocks.map(block => block.length))
+    return Array.from({ length: height }, (_, row) =>
+      group
+        .map((index, at) => {
+          const spread = at === 0 ? 0 : gap + Math.floor((extra * at) / (group.length - 1)) - Math.floor((extra * (at - 1)) / (group.length - 1))
+          return ' '.repeat(spread) + padCells(blocks[at]?.[row] ?? '', sizes[index] ?? 0)
+        })
+        .join(''),
+    )
+  })
+}
+
+/**
+ * The lines a terminal prints for `node` in `width` cells: a rough flexbox
+ * that never shrinks a child, so a row too wide for the pane shows as one.
+ * Code is its source, each line cut as `truncate-end` does.
+ */
+const paint = (node: unknown, width: number): string[] => {
+  if (typeof node === 'string') return [node]
+  const { type, props = {}, children = [] } = node as Drawn
+  if (type === 'Text') {
+    const lines = textOf(node).split('\n')
+    return String(props.wrap ?? 'wrap').startsWith('truncate')
+      ? lines.map(line => cutCells(line, width))
+      : lines.flatMap(line => wrapCells(line, width))
+  }
+  if (type === 'Button') return [buttonText(node as Drawn)]
+  if (type === 'Code') {
+    const gutter = gutterOf(props)
+    return String(props.source)
+      .split('\n')
+      .map((line, index) => {
+        const number = gutter > 0 ? `${String(Number(props.startLine) + index).padStart(gutter - 1)} ` : ''
+        return number + (props.wrap === 'truncate-end' ? cutCells(line, width - gutter) : line)
+      })
+  }
+  const left = space(props.paddingLeft ?? props.paddingX ?? props.padding)
+  const right = space(props.paddingRight ?? props.paddingX ?? props.padding)
+  const top = space(props.marginTop ?? props.marginY ?? props.margin, true)
+  const bottom = space(props.marginBottom ?? props.marginY ?? props.margin, true)
+  const inner = width - left - right
+  const lines =
+    props.flexDirection === 'column' ? children.flatMap(kid => paint(kid, inner)) : paintRow(children, inner, props)
+
+  return [...Array<string>(top).fill(''), ...lines.map(line => ' '.repeat(left) + line), ...Array<string>(bottom).fill('')]
+}
+
+/** The whole pane as printed at `columns`, trailing spaces kept. */
+const screen = async (ui: { drawn: () => Promise<unknown> }, columns: number): Promise<string[]> =>
+  paint(await ui.drawn(), columns)
+
+/** The lines above the terminal's dim `ctrl+x tab to focus` and its blank line. */
+const aboveKeys = (lines: readonly string[]): string[] =>
+  lines.at(-1)?.trimEnd() === 'ctrl+x tab to focus' ? lines.slice(0, -2) : [...lines]
+
+/** One row as printed at `columns`: its row Box, the indent of a desktop wrapper left out. */
+const rowLine = async (
+  ui: { find: (query: { key: string }) => Promise<Drawn | undefined> },
+  key: string,
+  columns = 60,
+): Promise<string> => {
+  const row = await ui.find({ key: `row:${oneLine(key)}` })
+  return row === undefined ? '' : paint(row, columns).join('\n')
+}
+
+/** The paths whose diff is drawn, in order. */
+const opened = async (ui: { drawn: () => Promise<unknown> }): Promise<string[]> => {
+  const out: string[] = []
+  const walk = (node: unknown) => {
+    if (node === null || typeof node !== 'object') return
+    const { key, props, children } = node as Drawn & { key?: string }
+    const name = key ?? props?.key
+    if (typeof name === 'string' && name.startsWith('diff:')) out.push(name.slice('diff:'.length))
+    const kids = children ?? props?.children
+    if (Array.isArray(kids)) kids.forEach(walk)
+    else walk(kids)
+  }
+  walk(await ui.drawn())
+  return out
+}
+
+/** An open file's diff as its lines read, Code's source split; undefined when none is drawn. */
+const diffOf = async (
+  ui: { find: (query: { key: string }) => Promise<Drawn | undefined> },
+  path: string,
+): Promise<string[] | undefined> => {
+  const box = await ui.find({ key: `diff:${oneLine(path)}` })
+  if (box === undefined) return undefined
+  return (box.children ?? []).flatMap(kid => {
+    const { type, props = {} } = kid as Drawn
+    return type === 'Code' ? String(props.source).split('\n') : [textOf(kid)]
+  })
+}
+
 // ------------------------------------------------------------------ pure
 
 describe('helpers', () => {
@@ -294,23 +509,25 @@ describe('helpers', () => {
     }
   })
 
-  test('fitHeader keeps the base whole and cuts the branch in the middle', async () => {
-    expect(fitHeader('feat', 'main', 40)).toBe('feat → main')
-    const fitted = fitHeader('worktree-fuzzy-dancing-penguin', 'main', 28)
-    expect(fitted).toMatch(/^worktree.*….*penguin → main$/)
-    expect(cellWidth(fitted)).toBeLessThanOrEqual(28)
-    const both = fitHeader('feat/HAR-123-login-form', 'origin/release/2026-10-long-name', 30)
-    expect(both).toMatch(/ → /)
-    expect(cellWidth(both)).toBeLessThanOrEqual(30)
-  })
-
   test('readConfig fills defaults and refuses odd values', async () => {
-    expect(readConfig({})).toEqual({ autoOpen: 'worktree', pollSeconds: 5, statusLine: false })
-    expect(readConfig({ autoOpen: 'never', pollSeconds: 0, statusLine: true })).toEqual({
+    expect(readConfig({})).toEqual({
+      autoOpen: 'worktree',
+      pollSeconds: 5,
+      statusLine: false,
+      diffStyle: 'quiet',
+      paneBackground: 'transparent',
+    })
+    expect(
+      readConfig({ autoOpen: 'never', pollSeconds: 0, statusLine: true, diffStyle: 'engine', paneBackground: 'theme' }),
+    ).toEqual({
       autoOpen: 'never',
       pollSeconds: 0,
       statusLine: true,
+      diffStyle: 'engine',
+      paneBackground: 'theme',
     })
+    expect(readConfig({ paneBackground: 'plaid' }).paneBackground).toBe('transparent')
+    expect(readConfig({ diffStyle: 'loud' }).diffStyle).toBe('quiet')
     expect(readConfig({ autoOpen: 'sometimes', pollSeconds: -3 }).autoOpen).toBe('worktree')
     expect(readConfig({ pollSeconds: -3 }).pollSeconds).toBe(0)
   })
@@ -348,19 +565,30 @@ describe('pane', () => {
 
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
-      expect((await ui.find({ type: 'Text', text: /feat → main/ }))?.text).toBe('feat → main')
-      expect(await ui.find({ type: 'Text', text: /reflog · 73481c5/ })).toBeDefined()
-      expect((await ui.find({ type: 'Text', text: /↑1 ↓1/ }))?.text).toBe('↑1 ↓1 · 7 files · ')
-      expect((await ui.find({ type: 'Text', text: /^\+8$/ }))?.text).toBe('+8')
-      expect((await ui.find({ type: 'Text', text: /^−3$/ }))?.text).toBe('−3')
+      const lines = await screen(ui, 60)
+      // Two header rows, the actions and a blank, the tabs, the rule on the terminal, the summary.
+      expect(lines.slice(0, 5).map(line => line.trimEnd())).toEqual([
+        `feat${' '.repeat(51)}↑1 ↓1`,
+        `vs main${' '.repeat(37)}reflog · 73481c5`,
+        'r: refresh  t: tree',
+        '',
+        'a: all   c: committed   u: uncommitted',
+      ])
+      const summary = lines[surface === 'terminal' ? 6 : 5] ?? ''
+      expect(summary).toMatch(/^7 files {2}● 4 uncommitted +\+8 −3$/)
+      expect(cellWidth(summary)).toBe(60)
+      // The branch is semibold, ↓ in warning: the base moved on.
+      expect((await ui.find({ type: 'Text', text: 'feat' }))?.props).toMatchObject({ weight: 'semibold' })
+      expect((await ui.find({ type: 'Text', text: '↓1' }))?.props).toMatchObject({ color: 'warning' })
+      expect((await ui.find({ type: 'Text', text: '  ● 4' }))?.props).toMatchObject({ color: 'suggestion' })
 
       const keys = (await ui.findAll({ type: 'Button' })).map(button => button.key)
       expect(keys).toEqual([
+        'refresh',
+        'view',
         'mode:all',
         'mode:committed',
         'mode:uncommitted',
-        'refresh',
-        'view',
         'file:a.txt',
         'file:bin.dat',
         'file:dir/ubin.bin',
@@ -370,24 +598,29 @@ describe('pane', () => {
         'file:untracked.md',
       ])
       expect((await ui.find({ key: 'mode:all' }))?.props.variant).toBe('primary')
+      expect((await ui.find({ key: 'mode:all' }))?.props.dimColor).toBeUndefined()
+      expect(JSON.stringify((await ui.find({ key: 'mode:all' }))?.children)).toContain('"weight":"semibold"')
       expect((await ui.find({ key: 'mode:committed' }))?.props.variant).toBeUndefined()
-      // Plain, so the terminal draws each hotkey beside its label.
-      for (const key of ['mode:all', 'mode:committed', 'mode:uncommitted', 'refresh']) {
-        expect((await ui.find({ key }))?.props).toMatchObject({ plain: true })
+      // Plain, so the terminal draws each hotkey beside its label; all but the current mode dim.
+      for (const key of ['mode:committed', 'mode:uncommitted', 'refresh', 'view']) {
+        expect((await ui.find({ key }))?.props).toMatchObject({ plain: true, dimColor: true })
       }
       expect((await ui.find({ key: 'mode:committed' }))?.props.hotkey).toBe('c')
       // Named for what a press does: back to the tree.
       expect((await ui.find({ key: 'view' }))?.props).toMatchObject({ label: 'tree', hotkey: 't', plain: true })
 
-      const row = (await ui.find({ key: 'file:a.txt' }))?.text ?? ''
+      const row = await rowLine(ui, 'file:a.txt')
       expect(row).toMatch(/^M ● a\.txt +\+3 −1$/)
-      if (surface === 'terminal') expect(row.length).toBe(60)
-      expect((await ui.find({ key: 'file:bin.dat' }))?.text).toMatch(/^A {3}bin\.dat +bin$/)
-      expect((await ui.find({ key: 'file:gone.txt' }))?.text).toMatch(/^D {3}gone\.txt +−2$/)
-      expect((await ui.find({ key: 'file:src/new näme.txt' }))?.text).toMatch(
-        /^R {3}src\/old name\.txt → src\/new näme\.txt +\+1$/,
-      )
-      expect((await ui.find({ key: 'file:untracked.md' }))?.text).toMatch(/^\? ● untracked\.md +\+3$/)
+      expect(cellWidth(row)).toBe(60)
+      expect(await rowLine(ui, 'file:bin.dat')).toMatch(/^A {3}bin\.dat +bin$/)
+      expect(await rowLine(ui, 'file:gone.txt')).toMatch(/^D {3}gone\.txt +−2$/)
+      expect(await rowLine(ui, 'file:src/new näme.txt')).toMatch(/^R {3}src\/new näme\.txt ← src\/old name\.txt +\+1$/)
+      expect(await rowLine(ui, 'file:untracked.md')).toMatch(/^\? ● untracked\.md +\+3$/)
+      // The Button is the path alone, its directories dim; the counts sit outside it.
+      expect((await ui.find({ key: 'file:a.txt' }))?.text).toBe('a.txt')
+      const nested = await ui.find({ key: 'file:dir/ubin.bin' })
+      expect(nested?.text).toBe('dir/ubin.bin')
+      expect(nested?.children[0]).toMatchObject({ type: 'Text', props: { dimColor: true }, children: ['dir/'] })
       await ui.unmount()
     }
   })
@@ -396,11 +629,11 @@ describe('pane', () => {
     world(on, { store: { view: 'list' } })
     await wtDiff($, 'refresh')
 
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 24 } })
-    const row = (await ui.find({ key: 'file:src/new näme.txt' }))?.text ?? ''
-    expect(row.length).toBeLessThanOrEqual(24)
-    expect(row).toContain('…')
-    expect(row).toContain('→')
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 18 } })
+    const row = await rowLine(ui, 'file:src/new näme.txt', 18)
+    expect(row).toBe('R   src/n…e.txt +1')
+    // No room for where it came from: the name alone.
+    expect((await ui.find({ key: 'file:src/new näme.txt' }))?.text).toBe('src/n…e.txt')
     await ui.unmount()
   })
 
@@ -409,11 +642,16 @@ describe('pane', () => {
     await wtDiff($, 'refresh')
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
-      expect(await ui.find({ type: 'Code' })).toBeUndefined()
+      expect(await opened(ui)).toEqual([])
 
       await ui.press({ key: 'file:a.txt' })
-      const code = await ui.find({ type: 'Code' })
-      expect(code?.props).toMatchObject({ format: 'diff', source: HUNKS_A_ALL, path: 'a.txt', wrap: 'truncate-end' })
+      // Quiet: each line in its colour, a marker and no background; the header its new line number.
+      expect(await diffOf(ui, 'a.txt')).toEqual(['@@ 1', '  line1', '- line2', '+ LINE2', '  line3', '+ line4', '+ extra'])
+      expect((await ui.find({ type: 'Text', text: '+ LINE2' }))?.props).toEqual({ color: 'success', wrap: 'truncate-end' })
+      expect((await ui.find({ type: 'Text', text: '- line2' }))?.props).toEqual({ color: 'error', wrap: 'truncate-end' })
+      expect((await ui.find({ type: 'Text', text: '  line1' }))?.props).toEqual({ dimColor: true, wrap: 'truncate-end' })
+      expect((await ui.find({ type: 'Text', text: '@@ 1' }))?.props).toEqual({ dimColor: true, wrap: 'truncate-end' })
+      expect(await ui.find({ type: 'Code' })).toBeUndefined()
       expect(state.calls).toContain(`diff -M ${MB} -- :(literal)a.txt`)
       expect(await ui.find({ key: 'collapse' })).toBeDefined()
 
@@ -421,12 +659,12 @@ describe('pane', () => {
       expect((await ui.find({ type: 'Text', text: 'Binary file' }))?.text).toBe('Binary file')
 
       await ui.press({ key: 'collapse' })
-      expect(await ui.find({ type: 'Code' })).toBeUndefined()
+      expect(await opened(ui)).toEqual([])
       expect(await ui.find({ type: 'Text', text: 'Binary file' })).toBeUndefined()
 
       await ui.press({ key: 'file:a.txt' })
       await ui.press({ key: 'file:a.txt' })
-      expect(await ui.find({ type: 'Code' })).toBeUndefined()
+      expect(await opened(ui)).toEqual([])
       await ui.unmount()
     }
   })
@@ -445,7 +683,174 @@ describe('pane', () => {
     expect((await ui.find({ type: 'Text', text: /more lines/ }))?.text).toBe(
       '… 101 more lines — open in editor',
     )
-    expect(String((await ui.find({ type: 'Code' }))?.props.source)).toMatch(/^@@ -0,0 \+1,399 @@/)
+    // Cut, a file added whole is still source: 399 lines, numbered from 1.
+    const code = await ui.find({ type: 'Code' })
+    expect(code?.props).toMatchObject({ format: 'source', path: 'a.txt', startLine: 1, wrap: 'truncate-end' })
+    const lines = String(code?.props.source).split('\n')
+    expect(lines.length).toBe(399)
+    expect(lines.slice(0, 2)).toEqual(['line 0', 'line 1'])
+    expect((await diffOf(ui, 'a.txt'))?.at(-1)).toBe('… 101 more lines — open in editor')
+    await ui.unmount()
+  })
+
+  test('a hunk header reads its new line number and function; tabs, blank and no-newline lines draw', async ($, on) => {
+    const diff =
+      'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n' +
+      '@@ -10,4 +10,4 @@ func main() {\n' +
+      ' \tx := 1\n-\ty := 2\n+\ty := 3\n \n' +
+      '@@ -40 +40 @@\n-end\n\\ No newline at end of file\n+end\n\\ No newline at end of file\n'
+    world(on, { table: featTable({ [`diff -M ${MB} -- :(literal)a.txt`]: ok(diff) }), store: { view: 'list' } })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      await ui.press({ key: 'file:a.txt' })
+      expect(await diffOf(ui, 'a.txt')).toEqual([
+        '@@ 10  func main() {',
+        '      x := 1',
+        '-     y := 2',
+        '+     y := 3',
+        '  ',
+        '@@ 40',
+        '- end',
+        '\\ No newline at end of file',
+        '+ end',
+        '\\ No newline at end of file',
+      ])
+      // The header dim, its function italic; the no-newline note dim.
+      expect((await ui.find({ type: 'Text', text: '@@ 10  func main() {' }))?.children).toMatchObject([
+        '@@ 10',
+        '  ',
+        { type: 'Text', props: { italic: true }, children: ['func main() {'] },
+      ])
+      expect((await ui.find({ type: 'Text', text: '\\ No newline at end of file' }))?.props).toMatchObject({ dimColor: true })
+      await ui.press({ key: 'file:a.txt' })
+      await ui.unmount()
+    }
+  })
+
+  test('a hunk leaving nothing on the new side names its first old line', async ($, on) => {
+    // A tracked file emptied but kept: git says `+0,0`, a line that is not there.
+    const diff = 'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +0,0 @@\n-line1\n-line2\n'
+    world(on, { table: featTable({ [`diff -M ${MB} -- :(literal)a.txt`]: ok(diff) }), store: { view: 'list' } })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.press({ key: 'file:a.txt' })
+    expect(await diffOf(ui, 'a.txt')).toEqual(['@@ −1', '- line1', '- line2'])
+    await ui.unmount()
+  })
+
+  test('a file added whole is source with line numbers; a deleted one is one line', async ($, on) => {
+    const { state } = world(on, {
+      table: featTable({
+        'diff --no-index -- /dev/null untracked.md': {
+          exitCode: 1,
+          stdout: 'diff --git a/untracked.md b/untracked.md\n@@ -0,0 +1,3 @@\n+u1\n+\tu2\n+u3\n',
+        },
+      }),
+      store: { view: 'list' },
+    })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      await ui.press({ key: 'file:untracked.md' })
+      // No `+`, no hunk header, no green block: the engine's source view, its tab kept for it to draw.
+      expect((await ui.find({ type: 'Code' }))?.props).toEqual({
+        format: 'source',
+        source: 'u1\n\tu2\nu3',
+        path: 'untracked.md',
+        startLine: 1,
+        wrap: 'truncate-end',
+      })
+
+      await ui.press({ key: 'file:gone.txt' })
+      const gone = await ui.find({ type: 'Text', text: /^deleted/ })
+      expect(gone?.text).toBe('deleted · 2 lines')
+      expect(gone?.props).toMatchObject({ color: 'error' })
+      expect(await opened(ui)).toEqual(['untracked.md'])
+      // Drawn from its counts: no git diff for it, on press or on refresh.
+      await wtDiff($, 'refresh')
+      expect(state.calls.filter(key => key.startsWith('diff') && key.includes('gone.txt'))).toEqual([])
+      await ui.press({ key: 'collapse' })
+      await ui.unmount()
+    }
+  })
+
+  test('diffStyle engine draws a modified file with the engine diff view', { options: { diffStyle: 'engine' } }, async ($, on) => {
+    world(on, { store: { view: 'list' } })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      await ui.press({ key: 'file:a.txt' })
+      expect((await ui.find({ type: 'Code' }))?.props).toEqual({
+        format: 'diff',
+        source: HUNKS_A_ALL,
+        path: 'a.txt',
+        wrap: 'truncate-end',
+      })
+      expect(await ui.find({ type: 'Text', text: '+ LINE2' })).toBeUndefined()
+      // A deleted file is still one line.
+      await ui.press({ key: 'file:gone.txt' })
+      expect((await ui.find({ type: 'Text', text: /^deleted/ }))?.text).toBe('deleted · 2 lines')
+      await ui.press({ key: 'collapse' })
+      await ui.unmount()
+    }
+  })
+
+  test('a quiet diff spends only the cells it draws: long lines are cut to the pane', async ($, on) => {
+    const big = (name: string) =>
+      ok(
+        `diff --git a/${name} b/${name}\n@@ -1,175 +1,175 @@\n` +
+          // Under the 30,000-character cap, so nothing is cut before the pane draws it.
+          Array.from({ length: 175 }, (_, i) => `-${String(i).padEnd(79, 'x')}\n+${String(i).padEnd(79, 'y')}`).join('\n') +
+          '\n',
+      )
+    world(on, {
+      table: featTable({
+        [`diff -M ${MB} -- :(literal)a.txt`]: big('a.txt'),
+        [`diff -M ${MB} -- :(literal)keep.txt`]: big('keep.txt'),
+        [`diff -M ${MB} -- :(literal)src/new näme.txt :(literal)src/old name.txt`]: big('src/new näme.txt'),
+      }),
+      store: { view: 'list' },
+    })
+    await wtDiff($, 'refresh')
+    const keys = ['file:a.txt', 'file:keep.txt', 'file:src/new näme.txt']
+    // As wide as its lines: two diffs fill the budget, the third waits.
+    const wide = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 1000 } })
+    for (const key of keys) await wide.press({ key })
+    expect(await opened(wide)).toEqual(['a.txt', 'keep.txt'])
+    expect(await wide.find({ type: 'Text', text: /^Diff hidden/ })).toBeDefined()
+    await wide.unmount()
+
+    // At 60 columns each line keeps a cell past the edge, for the ellipsis: all three fit.
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await opened(ui)).toEqual(['a.txt', 'keep.txt', 'src/new näme.txt'])
+    const lines = (await diffOf(ui, 'a.txt')) ?? []
+    expect(lines.length).toBe(351)
+    expect(lines[1]).toBe(`- ${'0'.padEnd(55, 'x')}`)
+    const screenLines = await screen(ui, 60)
+    for (const line of screenLines) expect(cellWidth(line)).toBeLessThanOrEqual(60)
+    expect(screenLines.find(line => line.includes('- 0x'))?.trimEnd()).toBe(`    - ${'0'.padEnd(53, 'x')}…`)
+    await ui.unmount()
+  })
+
+  test('a line cut across a wide character still ends in an ellipsis', async ($, on) => {
+    world(on, {
+      table: featTable({
+        [`diff -M ${MB} -- :(literal)a.txt`]: ok(
+          `diff --git a/a.txt b/a.txt\n@@ -1 +1 @@ ${'函数'.repeat(40)}\n-x\n+${'中文'.repeat(40)}\n`,
+        ),
+      }),
+      store: { view: 'list' },
+    })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.press({ key: 'file:a.txt' })
+    // 56 cells for the lines: one cell past them is half of a wide character.
+    const screenLines = await screen(ui, 60)
+    for (const line of screenLines) expect(cellWidth(line)).toBeLessThanOrEqual(60)
+    expect(screenLines.find(line => line.includes('+ 中'))?.trimEnd()).toBe(`    + ${'中文'.repeat(13)}…`)
+    expect(screenLines.find(line => line.includes('@@ 1'))?.trimEnd()).toBe(`    @@ 1  ${'函数'.repeat(12)}…`)
+    await ui.press({ key: 'collapse' })
     await ui.unmount()
   })
 
@@ -455,15 +860,21 @@ describe('pane', () => {
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
       await ui.press({ key: 'file:a.txt' })
+      // An open file's name is semibold.
+      expect((await ui.find({ key: 'file:a.txt' }))?.children).toMatchObject([
+        { type: 'Text', props: { weight: 'semibold' }, children: ['a.txt'] },
+      ])
 
       await ui.press({ key: 'mode:committed' })
       expect((await ui.find({ key: 'mode:committed' }))?.props.variant).toBe('primary')
       expect(await ui.find({ key: 'file:keep.txt' })).toBeUndefined()
       expect(await ui.find({ key: 'file:untracked.md' })).toBeUndefined()
       // No layer marks outside `all`.
-      expect((await ui.find({ key: 'file:a.txt' }))?.text).toMatch(/^M a\.txt +\+2 −1$/)
+      expect(await rowLine(ui, 'file:a.txt')).toMatch(/^M a\.txt +\+2 −1$/)
+      // The summary follows the mode: no legend outside `all`.
+      expect((await screen(ui, 60)).find(line => /^\d+ files? /.test(line))).toMatch(/^4 files +\+3 −3$/)
       expect(state.calls).toContain(`diff -M ${MB} HEAD -- :(literal)a.txt`)
-      expect(String((await ui.find({ type: 'Code' }))?.props.source)).toMatch(/^@@ -1,3 \+1,4 @@/)
+      expect(await diffOf(ui, 'a.txt')).toEqual(['@@ 1', '  line1', '- line2', '+ LINE2', '  line3', '+ line4'])
 
       await ui.press({ key: 'mode:uncommitted' })
       const keys = (await ui.findAll({ type: 'Button' })).map(button => button.key)
@@ -476,7 +887,7 @@ describe('pane', () => {
       // Back to `all`, nothing open, for the next surface: state outlives a mount.
       await ui.press({ key: 'mode:all' })
       await ui.press({ key: 'file:a.txt' })
-      expect(await ui.find({ type: 'Code' })).toBeUndefined()
+      expect(await opened(ui)).toEqual([])
       await ui.unmount()
     }
   })
@@ -510,7 +921,22 @@ describe('pane', () => {
     await wtDiff($, 'refresh')
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
-      expect((await ui.find({ type: 'Text', text: /No base branch found/ }))?.text).toMatch(/\/wt-diff base <ref>/)
+      const lines = aboveKeys(await screen(ui, 60)).map(line => line.trimEnd())
+      expect(lines.slice(0, 2)).toEqual(['main', 'vs —  no base branch'])
+      // No summary: the notice under a blank line is what follows the tabs.
+      const at = lines.indexOf('! Nothing to compare against')
+      expect(lines.slice(at - 1)).toEqual([
+        '',
+        '! Nothing to compare against',
+        '  Set one with /wt-diff base <ref>,',
+        '  or press u for uncommitted changes.',
+      ])
+      expect((await ui.find({ type: 'Text', text: /^! $/ }))?.props).toMatchObject({ color: 'warning' })
+      expect((await ui.find({ type: 'Text', text: /^Nothing to compare against$/ }))?.props).toMatchObject({ weight: 'semibold' })
+      expect((await ui.find({ type: 'Text', text: /^u$/ }))?.props).toMatchObject({ color: 'suggestion' })
+      // The command to type in the text color, the words around it dim.
+      expect((await ui.find({ type: 'Text', text: /^\/wt-diff base <ref>$/ }))?.props).toEqual({})
+      expect((await ui.find({ type: 'Text', text: /^Set one with $/ }))?.props).toMatchObject({ dimColor: true })
       expect(await ui.find({ key: 'mode:uncommitted' })).toBeDefined()
       await ui.unmount()
     }
@@ -521,6 +947,8 @@ describe('pane', () => {
       [`diff --numstat -z -M ${MB} --`]: ok(''),
       [`diff --name-status -z -M ${MB} --`]: ok(''),
       [`diff --name-only -z --no-renames ${MB} HEAD --`]: ok(''),
+      [`diff --numstat -z -M ${MB} HEAD --`]: ok(''),
+      [`diff --name-status -z -M ${MB} HEAD --`]: ok(''),
       'diff --name-only -z --no-renames HEAD --': ok(''),
       'ls-files --others --exclude-standard -z': ok(''),
       'rev-list --left-right --count main...HEAD': ok('1\t0\n'),
@@ -528,9 +956,22 @@ describe('pane', () => {
     await wtDiff($, 'refresh')
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
-      expect((await ui.find({ type: 'Text', text: /No changes/ }))?.text).toBe('No changes vs main')
+      const lines = aboveKeys(await screen(ui, 60)).map(line => line.trimEnd())
+      expect(lines.slice(-3)).toEqual(['', '✓ No changes vs main', '  Edits will show up here as you work.'])
+      expect(lines.some(line => /files?\b/.test(line))).toBe(false)
+      expect((await ui.find({ type: 'Text', text: /^✓ $/ }))?.props).toMatchObject({ color: 'success' })
+      // The line's own words, inside the line.
+      const words = (await ui.findAll({ type: 'Text', text: /^Edits will show up here as you work\.$/ })).pop()
+      expect(words?.props).toMatchObject({ dimColor: true })
       await ui.unmount()
     }
+
+    // `committed` lists no edit until it is committed.
+    await wtDiff($, 'mode committed')
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const lines = aboveKeys(await screen(ui, 60)).map(line => line.trimEnd())
+    expect(lines.slice(-2)).toEqual(['✓ No changes vs main', '  Commits on this branch will show up here.'])
+    await ui.unmount()
   })
 
   test('control characters in a diff or a path still draw', async ($, on) => {
@@ -551,17 +992,16 @@ describe('pane', () => {
     await wtDiff($, 'refresh')
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
-      expect((await ui.find({ key: `file:${odd}` }))?.text).toMatch(/^\? ● e\uFFFDsc\.txt +\+1$/)
+      expect(await rowLine(ui, `file:${odd}`)).toMatch(/^\? ● e\uFFFDsc\.txt +\+1$/)
 
       await ui.press({ key: 'file:a.txt' })
-      const source = String((await ui.find({ type: 'Code' }))?.props.source)
-      expect(source).toContain('+LINE2\uFFFD[31m')
-      expect(source).toContain('\n+\uFFFD')
+      const lines = await diffOf(ui, 'a.txt')
+      expect(lines).toContain('+ LINE2\uFFFD[31m')
+      expect(lines).toContain('+ \uFFFD')
 
       await ui.press({ key: `file:${odd}` })
-      const codes = await ui.findAll({ type: 'Code' })
-      expect(codes.length).toBe(2)
-      expect(String(codes[1]?.props.source)).toBe('@@ -0,0 +1 @@\n+\uFFFD[1mbold')
+      expect(await opened(ui)).toEqual(['a.txt', oneLine(odd)])
+      expect((await ui.find({ type: 'Code' }))?.props.source).toBe('\uFFFD[1mbold')
       await ui.press({ key: 'collapse' })
       await ui.unmount()
     }
@@ -576,7 +1016,7 @@ describe('pane', () => {
     await wtDiff($, 'refresh')
     for (const columns of [60, 16]) {
       const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: columns } })
-      const row = (await ui.find({ key: `file:${wide}` }))?.text ?? ''
+      const row = await rowLine(ui, `file:${wide}`, columns)
       expect(row).toMatch(/\+2$/)
       expect(cellWidth(row)).toBe(columns)
       await ui.unmount()
@@ -606,9 +1046,10 @@ describe('pane', () => {
     await wtDiff($, 'mode uncommitted')
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
-      expect(await ui.find({ type: 'Text', text: /no base/ })).toBeDefined()
-      expect((await ui.find({ type: 'Text', text: /files · $/ }))?.text).toBe('2 files · ')
-      expect((await ui.find({ type: 'Text', text: /^\+2$/ }))?.text).toBe('+2')
+      expect((await ui.find({ type: 'Text', text: /no base/ }))?.props).toMatchObject({ color: 'warning' })
+      expect((await screen(ui, 60)).find(line => line.startsWith('2 files'))).toMatch(/^2 files +\+2 −0$/)
+      // No ↑↓ with nothing to count them from.
+      expect(await ui.find({ type: 'Text', text: /↑/ })).toBeUndefined()
       expect(await ui.find({ key: 'file:keep.txt' })).toBeDefined()
       await ui.unmount()
     }
@@ -624,15 +1065,15 @@ describe('pane', () => {
     world(on, {
       table: featTable({
         [`diff -M ${MB} -- :(literal)a.txt`]: big('a.txt'),
-        [`diff -M ${MB} -- :(literal)gone.txt`]: big('gone.txt'),
         [`diff -M ${MB} -- :(literal)keep.txt`]: big('keep.txt'),
+        'diff --no-index -- /dev/null untracked.md': { exitCode: 1, stdout: big('untracked.md').stdout },
       }),
     })
     await wtDiff($, 'refresh')
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 1000 } })
-    for (const key of ['file:a.txt', 'file:gone.txt', 'file:keep.txt']) await ui.press({ key })
+    for (const key of ['file:a.txt', 'file:keep.txt', 'file:untracked.md']) await ui.press({ key })
 
-    expect((await ui.findAll({ type: 'Code' })).map(code => code.props.path)).toEqual(['a.txt', 'gone.txt'])
+    expect((await ui.findAll({ type: 'Code' })).map(code => code.props.path)).toEqual(['a.txt', 'keep.txt'])
     expect((await ui.find({ type: 'Text', text: /^Diff hidden/ }))?.text).toBe(
       'Diff hidden: too much is open. Collapse other files to see it.',
     )
@@ -667,7 +1108,7 @@ describe('pane', () => {
     await ui.unmount()
   })
 
-  test('a refresh the person asked for shows … in the header until it lands', async ($, on) => {
+  test('a refresh the person asked for shows ↻ in the header until it lands', async ($, on) => {
     const { state } = world(on)
     await wtDiff($, 'refresh')
     const held = gate()
@@ -678,15 +1119,19 @@ describe('pane', () => {
     await reached.promise
 
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect((await ui.find({ type: 'Text', text: ' …' }))?.text).toBe(' …')
+    const busy = (await screen(ui, 60))[0] ?? ''
+    expect(busy).toMatch(/^feat +↻ ↑1 ↓1$/)
     state.hold = undefined
     held.open()
     await pending
-    expect(await ui.find({ type: 'Text', text: ' …' })).toBeUndefined()
+    // Its cells stay: nothing moves when it goes.
+    const idle = (await screen(ui, 60))[0] ?? ''
+    expect(idle).toBe(busy.replace('↻', ' '))
+    expect(await ui.find({ type: 'Text', text: '↻' })).toBeUndefined()
     await ui.unmount()
   })
 
-  test('a reload clears a … that the cut-short pass left behind', async ($, on) => {
+  test('a reload clears a ↻ that the cut-short pass left behind', async ($, on) => {
     const { state } = world(on)
     await wtDiff($, 'refresh')
     const held = gate()
@@ -700,7 +1145,7 @@ describe('pane', () => {
     await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
 
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect(await ui.find({ type: 'Text', text: ' …' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: '↻' })).toBeUndefined()
     held.open()
     await pending
     await ui.unmount()
@@ -714,14 +1159,36 @@ describe('pane', () => {
 
     state.table = featTable({ [`diff --numstat -z -M ${MB} --`]: fail(128, 'fatal: index.lock\n') })
     await wtDiff($, 'refresh')
-    expect((await ui.find({ type: 'Text', text: /^Error:/ }))?.text).toBe('Error: git diff failed: fatal: index.lock')
+    // No list read: the notice alone, no rows.
+    expect((await ui.find({ type: 'Text', text: /git failed/ }))?.text).toBe('✕ git failed')
+    expect(await ui.find({ key: 'file:a.txt' })).toBeUndefined()
+    expect((await ui.find({ type: 'Text', text: /index\.lock/ }))?.text).toBe('git diff failed: fatal: index.lock')
 
     state.table = featTable()
     const before = state.calls.length
     await wtDiff($, 'refresh')
     expect(state.calls.slice(before)).toContain(`diff -M ${MB} -- :(literal)a.txt`)
-    expect((await ui.find({ type: 'Code' }))?.props.source).toBe(HUNKS_A_ALL)
+    expect((await diffOf(ui, 'a.txt'))?.[0]).toBe('@@ 1')
     expect(await ui.find({ key: 'collapse' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  // An orphan branch: uncommitted still lists HEAD to the working tree, under the error.
+  test('a failure that kept its rows draws the notice above them, with no summary', async ($, on) => {
+    world(on, { store: { view: 'list' }, table: featTable({ 'merge-base main HEAD': fail(1, '') }) })
+    await wtDiff($, 'mode uncommitted')
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const lines = (await screen(ui, 60)).map(line => line.trimEnd())
+    const at = lines.indexOf('✕ git failed')
+    expect(lines.slice(at, at + 4)).toEqual([
+      '✕ git failed',
+      '  No common ancestor between main and HEAD',
+      '  r to retry',
+      '',
+    ])
+    expect(lines[at + 4]).toMatch(/^M a\.txt +\+1$/)
+    expect(lines.some(line => /^\d+ files? /.test(line))).toBe(false)
+    expect(await ui.find({ key: 'file:untracked.md' })).toBeDefined()
     await ui.unmount()
   })
 
@@ -733,7 +1200,7 @@ describe('pane', () => {
     })
     await wtDiff($, 'refresh')
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect((await ui.find({ type: 'Text', text: /^Error:/ }))?.text).toBe('Error: git diff failed: output over 4 MiB')
+    expect((await ui.find({ type: 'Text', text: /4 MiB/ }))?.text).toBe('git diff failed: output over 4 MiB')
     expect(await ui.find({ key: 'file:part' })).toBeUndefined()
     await ui.unmount()
   })
@@ -742,7 +1209,9 @@ describe('pane', () => {
     world(on, { table: featTable({ [`diff --numstat -z -M ${MB} --`]: fail(128, 'fatal: bad object\n') }) })
     await wtDiff($, 'refresh')
     const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-    expect((await ui.find({ type: 'Text', text: /^Error:/ }))?.text).toBe('Error: git diff failed: fatal: bad object')
+    expect((await ui.find({ type: 'Text', text: /bad object/ }))?.text).toBe('git diff failed: fatal: bad object')
+    expect((await ui.find({ type: 'Text', text: /^✕ $/ }))?.props).toMatchObject({ color: 'error' })
+    expect((await ui.find({ type: 'Text', text: /to retry/ }))?.text).toBe('r to retry')
     await ui.unmount()
   })
 
@@ -793,7 +1262,7 @@ const rowKeys = async (ui: { findAll: (query: { type: string }) => Promise<{ key
     .map(button => button.key ?? '')
     .filter(key => key.startsWith('dir:') || key.startsWith('file:'))
 
-/** The Buttons and Code blocks of a drawing, in document order: `file:a.txt`, `code:a.txt`. */
+/** The Buttons and open diffs of a drawing, in document order: `file:a.txt`, `code:a.txt`. */
 const order = (node: unknown, out: string[] = []): string[] => {
   if (node === null || typeof node !== 'object') return out
   const { type, key, props, children } = node as {
@@ -803,7 +1272,7 @@ const order = (node: unknown, out: string[] = []): string[] => {
     children?: unknown
   }
   if (type === 'Button') out.push(String(key ?? props?.key ?? ''))
-  else if (type === 'Code') out.push(`code:${String(props?.path)}`)
+  else if (String(key ?? props?.key ?? '').startsWith('diff:')) out.push(`code:${String(key ?? props?.key).slice('diff:'.length)}`)
   const kids = children ?? props?.children
   if (Array.isArray(kids)) for (const kid of kids) order(kid, out)
   else order(kids, out)
@@ -817,13 +1286,13 @@ type Finder = { find: (query: { key: string }) => Promise<Found> }
 /** A tree row's indent: leading spaces on terminal, its Box's padding elsewhere. */
 const indentOf = async (ui: Finder, surface: string, key: string): Promise<number> =>
   surface === 'terminal'
-    ? (/^ */.exec((await ui.find({ key }))?.text ?? '')?.[0].length ?? 0)
+    ? (/^ */.exec(await rowLine(ui, key))?.[0].length ?? 0)
     : Number((await ui.find({ key: `at:${key}` }))?.props.paddingLeft ?? 0)
 
-/** A tree row at `cells` of indent whose label then reads `rest`. */
+/** A tree row at `cells` of indent that then reads `rest`. */
 const expectRow = async (ui: Finder, surface: string, key: string, cells: number, rest: RegExp) => {
   expect(await indentOf(ui, surface, key)).toBe(cells)
-  expect(((await ui.find({ key }))?.text ?? '').slice(surface === 'terminal' ? cells : 0)).toMatch(rest)
+  expect((await rowLine(ui, key)).slice(surface === 'terminal' ? cells : 0)).toMatch(rest)
 }
 
 describe('tree view', () => {
@@ -837,33 +1306,41 @@ describe('tree view', () => {
       expect((await ui.find({ key: 'view' }))?.props).toMatchObject({ label: 'list', hotkey: 't', plain: true })
       expect((await ui.find({ key: 'fold' }))?.props).toMatchObject({ label: 'fold', hotkey: 'z', plain: true })
 
-      const text = async (key: string) => (await ui.find({ key }))?.text ?? ''
+      const text = (key: string) => rowLine(ui, key)
       const row = (key: string, cells: number, rest: RegExp) => expectRow(ui, surface, key, cells, rest)
-      await row('dir:deep/a/b', 0, /^▾ deep\/a\/b\/ +\+3$/)
+      // An open directory leaves the counts to its files.
+      await row('dir:deep/a/b', 0, /^▾ deep\/a\/b\/$/)
       await row('file:deep/a/b/c.md', 2, /^\? ● c\.md +\+2$/)
-      // Binary files add no lines: nothing to sum.
       expect(await text('dir:dir')).toBe('▾ dir/')
       await row('file:dir/ubin.bin', 2, /^\? ● ubin\.bin +bin$/)
-      await row('dir:src', 0, /^▾ src\/ +\+5$/)
-      await row('dir:src/lib', 2, /^▾ lib\/ +\+4$/)
+      await row('dir:src', 0, /^▾ src\/$/)
+      await row('dir:src/lib', 2, /^▾ lib\/$/)
       await row('file:src/lib/x.ts', 4, /^\? ● x\.ts +\+4$/)
-      await row('file:src/new näme.txt', 2, /^R {3}new näme\.txt ← src\/old name\.txt +\+1$/)
+      // A rename within its directory says only the old name.
+      await row('file:src/new näme.txt', 2, /^R {3}new näme\.txt ← old name\.txt +\+1$/)
       await row('file:a.txt', 0, /^M ● a\.txt +\+3 −1$/)
       // A native button drops leading spaces: elsewhere the indent is layout.
       if (surface !== 'terminal') {
         for (const key of TREE_KEYS) expect(await text(key)).toMatch(/^\S/)
       }
-      // The sums are dim, a file's own counts in color.
-      const src = await ui.find({ key: 'dir:src' })
-      expect(JSON.stringify(src?.children)).toContain('dimColor')
+      // Only the name is the Button, the arrow dim in it; a file's counts in color, outside it.
+      expect((await ui.find({ key: 'dir:src' }))?.children).toEqual([
+        { type: 'Text', props: { dimColor: true }, children: ['▾ '] },
+        'src/',
+      ])
+      expect((await ui.find({ key: 'file:a.txt' }))?.text).toBe('a.txt')
+      expect(JSON.stringify((await ui.find({ key: 'row:file:a.txt' }))?.children.at(-1))).toContain('"color":"success"')
       if (surface === 'terminal') {
-        for (const key of TREE_KEYS) expect(cellWidth(await text(key))).toBe(key === 'dir:dir' ? 6 : 60)
+        // A file row reaches the edge; an open directory row ends at its name.
+        for (const key of TREE_KEYS) {
+          expect(cellWidth(await text(key))).toBe(key.startsWith('file:') ? 60 : (await text(key)).trimEnd().length)
+        }
       }
       await ui.unmount()
     }
   })
 
-  test('removed lines add up in a directory row too', async ($, on) => {
+  test('removed lines add up in a folded directory row too', async ($, on) => {
     world(on, {
       table: featTable({
         [`diff --numstat -z -M ${MB} --`]: ok('3\t1\tlib/a.txt\0' + '0\t2\tlib/gone.txt\0'),
@@ -875,7 +1352,8 @@ describe('tree view', () => {
     })
     await wtDiff($, 'refresh')
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect((await ui.find({ key: 'dir:lib' }))?.text).toMatch(/^▾ lib\/ +\+3 −3$/)
+    await ui.press({ key: 'dir:lib' })
+    expect(await rowLine(ui, 'dir:lib')).toMatch(/^▸ lib\/ \(2\) +\+3 −3$/)
     await ui.unmount()
   })
 
@@ -885,11 +1363,16 @@ describe('tree view', () => {
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
       await ui.press({ key: 'dir:src' })
-      expect((await ui.find({ key: 'dir:src' }))?.text).toMatch(/^▸ src\/ \(2\) +\+5$/)
+      expect(await rowLine(ui, 'dir:src')).toMatch(/^▸ src\/ \(2\) +\+5$/)
+      expect((await ui.find({ key: 'dir:src' }))?.text).toBe('▸ src/')
+      // The count and the sums are dim.
+      const row = await ui.find({ key: 'row:dir:src' })
+      expect(JSON.stringify(row?.children[0])).toContain('{"type":"Text","props":{"dimColor":true},"children":[" (2)"]}')
+      expect(row?.children[1]).toEqual({ type: 'Text', props: { dimColor: true }, children: ['+5'] })
       expect(await rowKeys(ui)).toEqual(TREE_KEYS.filter(key => !/^(dir|file):src\//.test(key)))
 
       await ui.press({ key: 'dir:src' })
-      expect((await ui.find({ key: 'dir:src' }))?.text).toMatch(/^▾ src\/ +\+5$/)
+      expect(await rowLine(ui, 'dir:src')).toBe('▾ src/')
       expect(await rowKeys(ui)).toEqual(TREE_KEYS)
       await ui.unmount()
     }
@@ -945,7 +1428,7 @@ describe('tree view', () => {
       const ui = await $.ui.mount({ ...PANE, surface })
       await ui.press({ key: 'view' })
       expect(await rowKeys(ui)).toEqual([...TREE_KEYS].filter(key => key.startsWith('file:')).sort())
-      expect((await ui.find({ key: 'file:src/lib/x.ts' }))?.text).toMatch(/^\? ● src\/lib\/x\.ts +\+4$/)
+      expect(await rowLine(ui, 'file:src/lib/x.ts')).toMatch(/^\? ● src\/lib\/x\.ts +\+4$/)
       expect((await ui.find({ key: 'view' }))?.props.label).toBe('tree')
       expect(await ui.find({ key: 'fold' })).toBeUndefined()
       expect(state.store.get('view')).toBe('list')
@@ -987,7 +1470,7 @@ describe('tree view', () => {
       expect(after('file:src/lib/x.ts')).toEqual(['file:src/lib/x.ts', 'code:src/lib/x.ts', 'file:src/new näme.txt'])
       // Folding a directory above it leaves it open.
       await ui.press({ key: 'dir:src' })
-      expect(await ui.find({ type: 'Code' })).toBeDefined()
+      expect(await opened(ui)).toEqual(['a.txt'])
       await ui.press({ key: 'dir:src' })
       await ui.press({ key: 'file:a.txt' })
       await ui.press({ key: 'file:src/lib/x.ts' })
@@ -1004,15 +1487,16 @@ describe('tree view', () => {
     await wtDiff($, 'refresh')
     for (const columns of [60, 16]) {
       const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: columns } })
-      const lead = async (key: string) => /^ */.exec((await ui.find({ key }))?.text ?? '')?.[0].length
+      const lead = async (key: string) => /^ */.exec(await rowLine(ui, key, columns))?.[0].length
       expect(await lead('dir:p')).toBe(0)
       expect(await lead('dir:p/r')).toBe(2)
       expect(await lead('file:p/r/s.txt')).toBe(4)
       expect(await lead('dir:p/r/t/v')).toBe(columns === 60 ? 6 : 5)
       expect(await lead('file:p/r/t/v/w.txt')).toBe(columns === 60 ? 8 : 5)
-      for (const button of await ui.findAll({ type: 'Button' })) {
-        if (button.key?.startsWith('file:')) expect(cellWidth(button.text)).toBe(columns)
-        if (button.key?.startsWith('dir:')) expect(cellWidth(button.text)).toBeLessThanOrEqual(columns)
+      for (const key of await rowKeys(ui)) {
+        const row = await rowLine(ui, key, columns)
+        if (key.startsWith('file:')) expect(cellWidth(row)).toBe(columns)
+        else expect(cellWidth(row)).toBeLessThanOrEqual(columns)
       }
       await ui.unmount()
     }
@@ -1033,7 +1517,7 @@ describe('tree view', () => {
     await wtDiff($, 'refresh')
     for (const columns of [60, 16]) {
       const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: columns } })
-      const text = async (key: string) => (await ui.find({ key }))?.text ?? ''
+      const text = (key: string) => rowLine(ui, key, columns)
       const file = await text('file:p/r/t/v/w.md')
       expect(cellWidth(file)).toBe(columns)
       expect(file).toMatch(columns === 60 ? /^ {8}M {3}w\.md +\+12 −3$/ : /^ M {3}w\.md +\+12 −3$/)
@@ -1057,14 +1541,14 @@ describe('tree view', () => {
       .at(-1)
     expect(JSON.stringify(controls?.children)).toContain('"fold"')
     expect(controls?.props).toMatchObject({ flexDirection: 'row', flexWrap: 'wrap' })
-    const renamed = (await ui.find({ key: 'file:src/new näme.txt' }))?.text ?? ''
+    const renamed = await rowLine(ui, 'file:src/new näme.txt', 40)
     expect(cellWidth(renamed)).toBe(40)
-    expect(renamed).toMatch(/^ {2}R {3}new näme\.txt ← src\/old name\.txt +\+1$/)
+    expect(renamed).toMatch(/^ {2}R {3}new näme\.txt ← old name\.txt +\+1$/)
 
     // No room for where it came from: the name alone.
     await ui.unmount()
     const narrow = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 22 } })
-    const cut = (await narrow.find({ key: 'file:src/new näme.txt' }))?.text ?? ''
+    const cut = await rowLine(narrow, 'file:src/new näme.txt', 22)
     expect(cellWidth(cut)).toBe(22)
     expect(cut).not.toContain('←')
     await narrow.unmount()
@@ -1084,7 +1568,7 @@ describe('tree view', () => {
     state.table = treeTable()
     await wtDiff($, 'refresh')
     expect((await ui.find({ key: 'dir:deep/a/b' }))?.text).toMatch(/^▾ /)
-    expect((await ui.find({ key: 'dir:src/lib' }))?.text).toMatch(/^ {2}▾ /)
+    expect(await rowLine(ui, 'dir:src/lib')).toMatch(/^ {2}▾ /)
     await ui.unmount()
   })
 
@@ -1134,21 +1618,22 @@ describe('tree view', () => {
 
     // What each row reads, the gap before its counts shown as ` | `.
     const expected = [
-      '▾ .claude-plugin/ | +37',
+      '▾ .claude-plugin/',
       '  A   marketplace.json | +6',
       '  A   plugin.json | +31',
       '▾ assets/',
       '  A   icon.png | bin',
-      '▾ docs/superpowers/ | +258',
-      '  ▾ plans/ | +39',
+      '▾ docs/superpowers/',
+      '  ▾ plans/',
       '    ▾ archive/',
+      // Moved to another directory: the old path in full, cut to fit.
       '      R   2026-10-29-worktree-diff-pane.md ← docs/su…pane.md',
       '    ? ● 2026-10-30-trunk-and-tree-view.md | +39',
-      '  ▾ specs/ | +219',
+      '  ▾ specs/',
       '    A   2026-10-29-worktree-diff-pane.md | +129',
       '    ? ● 2026-10-30-trunk-and-tree-view.md | +90',
-      '▾ hooks/ | +5271',
-      '  ▾ fixtures/ | +3',
+      '▾ hooks/',
+      '  ▾ fixtures/',
       '    A   numstat.txt | +3',
       '  A ● git.test.ts | +1305',
       '  A ● git.ts | +934',
@@ -1157,24 +1642,26 @@ describe('tree view', () => {
       '  A ● register.tsx | +1142',
       '  ? ● tree.test.ts | +148',
       '  ? ● tree.ts | +126',
-      '▾ scripts/ | +2',
+      '▾ scripts/',
       '  A   sync.sh | +2',
-      '▾ types/ | +88',
+      '▾ types/',
       '  A ● index.d.ts | +88',
       'D   .gitignore | −2',
       'M ● LICENSE | +1 −4',
       'A   README.md | +136',
     ]
     const shown = async (ui: Finder & Parameters<typeof rowKeys>[0]) =>
-      Promise.all((await rowKeys(ui)).map(async key => (await ui.find({ key }))?.text ?? ''))
+      Promise.all((await rowKeys(ui)).map(key => rowLine(ui, key)))
     const terminal = await $.ui.mount({ ...PANE, surface: 'terminal' })
     const lines = await shown(terminal)
     expect(lines.map(line => line.replace(/ {2,}(?=[+−b])/, ' | ').trimEnd())).toEqual(expected)
     // A file row and a counted directory row fill the width; the header sums every file.
     for (const line of lines) if (/[+−]\d+$|bin$/.test(line) || line.includes('←')) expect(cellWidth(line)).toBe(60)
-    expect((await terminal.find({ key: 'dir:hooks' }))?.text).toMatch(/^▾ hooks\/ +\+5271$/)
+    await terminal.press({ key: 'dir:hooks' })
+    expect(await rowLine(terminal, 'dir:hooks')).toMatch(/^▸ hooks\/ \(8\) +\+5271$/)
+    await terminal.press({ key: 'dir:hooks' })
     await terminal.press({ key: 'dir:docs/superpowers' })
-    expect((await terminal.find({ key: 'dir:docs/superpowers' }))?.text).toMatch(/^▸ docs\/superpowers\/ \(4\) +\+258$/)
+    expect(await rowLine(terminal, 'dir:docs/superpowers')).toMatch(/^▸ docs\/superpowers\/ \(4\) +\+258$/)
     expect((await rowKeys(terminal)).length).toBe(expected.length - 7)
     await terminal.press({ key: 'dir:docs/superpowers' })
     await terminal.unmount()
@@ -1218,6 +1705,456 @@ describe('tree view', () => {
   })
 })
 
+// -------------------------------------------------------------- keyboard
+
+const FOCUSED_PANE = { ...PANE, props: { ...PANE.props, isFocused: true } } as const
+
+/** The person moving the pane's ring: onto one of the mod's elements, or with none onto an engine stop. */
+const personFocus = ($: Engine, element?: string) =>
+  $.ui.focus({
+    component: 'Pane',
+    requestId: 'worktree-diff',
+    ...(element !== undefined ? { element, plugin: 'worktree-diff' } : {}),
+    origin: { kind: 'person' },
+  } as never)
+
+/** Presses the key Buttons in turn: `jjk`. */
+const keys = async (ui: { press: (target: { key: string }) => Promise<unknown> }, presses: string) => {
+  for (const key of presses) await ui.press({ key: `nav:${key}` })
+}
+
+/** The row Button the ring starts on, if any; there is at most one. */
+const autoFocused = async (ui: { findAll: (query: { type: string }) => Promise<{ key?: string; props: Record<string, unknown> }[]> }) => {
+  const marked = (await ui.findAll({ type: 'Button' })).filter(button => button.props.autoFocus === true)
+  expect(marked.length).toBeLessThanOrEqual(1)
+  return marked[0]?.key
+}
+
+/** The rows as the pane draws them, each at the depth its indent shows. */
+const navRows = async (ui: Finder & Parameters<typeof rowKeys>[0], surface: string): Promise<NavRow[]> =>
+  Promise.all(
+    (await rowKeys(ui)).map(async key => ({
+      key,
+      kind: key.startsWith('dir:') ? ('dir' as const) : ('file' as const),
+      path: key.slice(key.indexOf(':') + 1),
+      depth: (await indentOf(ui, surface, key)) / 2,
+    })),
+  )
+
+/** Where j (or k) takes the ring from `from`, again and again, until it stops. */
+const walk = (rows: readonly NavRow[], from: string | undefined, key: 'j' | 'k'): string[] => {
+  const seen: string[] = []
+  let at = from
+  for (let step = 0; step <= rows.length; step++) {
+    const action = navAction(rows, at, key, () => true)
+    if (action === null) break
+    expect(action).toHaveProperty('focus')
+    at = (action as { focus: string }).focus
+    seen.push(at)
+  }
+  return seen
+}
+
+const FOLDED_SRC = TREE_KEYS.filter(key => !/^(dir|file):src\//.test(key))
+const LIST_KEYS = TREE_KEYS.filter(key => key.startsWith('file:')).sort()
+
+describe('keyboard', () => {
+  test('j/k/g/e walk the tree rows as drawn, past a folded directory, and stop at either end', async ($, on) => {
+    world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...FOCUSED_PANE, surface })
+      await ui.press({ key: 'dir:src' })
+      const rows = await navRows(ui, surface)
+      const open = () => true
+      // Off any row (a reload lost it, or a control holds the ring) j starts at the first, k at the last.
+      for (const off of [undefined, 'mode:all']) {
+        expect(walk(rows, off, 'j')).toEqual(FOLDED_SRC)
+        expect(walk(rows, off, 'k')).toEqual([...FOLDED_SRC].reverse())
+      }
+      expect(navAction(rows, 'file:a.txt', 'j', open)).toEqual({ focus: 'file:bin.dat' })
+      expect(navAction(rows, 'file:a.txt', 'k', open)).toEqual({ focus: 'dir:src' })
+      // Nothing past either end.
+      expect(navAction(rows, FOLDED_SRC[0], 'k', open)).toBeNull()
+      expect(navAction(rows, 'file:untracked.md', 'j', open)).toBeNull()
+      expect(navAction(rows, 'file:a.txt', 'g', open)).toEqual({ focus: 'dir:deep/a/b' })
+      expect(navAction(rows, 'dir:deep/a/b', 'g', open)).toBeNull()
+      expect(navAction(rows, undefined, 'e', open)).toEqual({ focus: 'file:untracked.md' })
+      expect(navAction(rows, 'file:untracked.md', 'e', open)).toBeNull()
+      await ui.press({ key: 'dir:src' })
+      await ui.unmount()
+    }
+  })
+
+  test('j/k walk the list view in its order; h has no directory to go up to', async ($, on) => {
+    world(on, { table: treeTable(), files: treeFiles, store: { view: 'list' } })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...FOCUSED_PANE, surface })
+      const rows = await navRows(ui, surface)
+      expect(walk(rows, undefined, 'j')).toEqual(LIST_KEYS)
+      expect(walk(rows, LIST_KEYS.at(-1), 'k')).toEqual([...LIST_KEYS].reverse().slice(1))
+      expect(navAction(rows, 'file:src/lib/x.ts', 'h', () => false)).toBeNull()
+      expect(navAction(rows, 'file:src/lib/x.ts', 'l', () => false)).toEqual({ file: 'src/lib/x.ts' })
+      await ui.unmount()
+    }
+  })
+
+  test('h folds an open directory or goes up; l opens a folded one or a diff, or goes in', async ($, on) => {
+    world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...FOCUSED_PANE, surface: 'terminal' })
+    const rows = await navRows(ui, 'terminal')
+    await ui.unmount()
+    const shut = new Set(['dir:src/lib', 'file:a.txt', 'file:src/lib/x.ts'])
+    const isOpen = (row: NavRow) => !shut.has(row.key)
+    const act = (focused: string | undefined, key: 'h' | 'l') => navAction(rows, focused, key, isOpen)
+
+    // A file goes up to its directory, a folded directory to its parent.
+    expect(act('file:src/lib/x.ts', 'h')).toEqual({ focus: 'dir:src/lib' })
+    expect(act('dir:src/lib', 'h')).toEqual({ focus: 'dir:src' })
+    expect(act('file:deep/a/b/d.md', 'h')).toEqual({ focus: 'dir:deep/a/b' })
+    // An open directory folds.
+    expect(act('dir:src', 'h')).toEqual({ dir: 'src' })
+    // At the top level there is nowhere to go up to.
+    expect(act('file:a.txt', 'h')).toBeNull()
+    expect(navAction(rows, 'dir:src', 'h', () => false)).toBeNull()
+    // A folded directory opens; an open one goes in, to its first row.
+    expect(act('dir:src/lib', 'l')).toEqual({ dir: 'src/lib' })
+    expect(act('dir:src', 'l')).toEqual({ focus: 'dir:src/lib' })
+    expect(act('dir:deep/a/b', 'l')).toEqual({ focus: 'file:deep/a/b/c.md' })
+    // A file opens its diff; one open already stays as it is.
+    expect(act('file:a.txt', 'l')).toEqual({ file: 'a.txt' })
+    expect(act('file:bin.dat', 'l')).toBeNull()
+    // Off the rows neither does anything.
+    for (const off of [undefined, 'refresh']) {
+      expect(act(off, 'h')).toBeNull()
+      expect(act(off, 'l')).toBeNull()
+    }
+  })
+
+  test('h and l fold, open and load as the ring says, on terminal and desktop', async ($, on) => {
+    world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...FOCUSED_PANE, surface })
+      await personFocus($, 'dir:src/lib')
+      await keys(ui, 'h')
+      expect(await rowKeys(ui)).not.toContain('file:src/lib/x.ts')
+      await keys(ui, 'l')
+      expect(await rowKeys(ui)).toEqual(TREE_KEYS)
+      // Clicking a key's own Button moves the ring onto it: the row it acts from stays.
+      await personFocus($, 'file:a.txt')
+      await personFocus($, 'nav:l')
+      await keys(ui, 'l')
+      expect(await opened(ui)).toEqual(['a.txt'])
+      await keys(ui, 'l')
+      expect(await opened(ui)).toEqual(['a.txt'])
+      // On a control, or one of the engine's stops, no row holds the ring: h and l do nothing.
+      await personFocus($, 'refresh')
+      await keys(ui, 'hl')
+      await personFocus($)
+      await keys(ui, 'hl')
+      expect(await opened(ui)).toEqual(['a.txt'])
+      expect(await rowKeys(ui)).toEqual(TREE_KEYS)
+      await ui.press({ key: 'collapse' })
+      await ui.unmount()
+    }
+  })
+
+  test('h and l act on the rows as listed now, not as last drawn', async ($, on) => {
+    world(on, {
+      table: treeTable({
+        'diff --no-index -- /dev/null src/lib/x.ts': {
+          exitCode: 1,
+          stdout: 'diff --git a/src/lib/x.ts b/src/lib/x.ts\n@@ -0,0 +1,4 @@\n+1\n+2\n+3\n+4\n',
+        },
+      }),
+      files: treeFiles,
+    })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...FOCUSED_PANE, surface })
+      // Folded out of the listing, the row the ring was on is no row to act from.
+      await ui.press({ key: 'dir:src' })
+      await personFocus($, 'file:src/lib/x.ts')
+      await keys(ui, 'l')
+      expect(await rowKeys(ui)).toEqual(FOLDED_SRC)
+      await ui.press({ key: 'dir:src' })
+      expect(await opened(ui)).toEqual([])
+      await personFocus($, 'file:src/lib/x.ts')
+      await keys(ui, 'l')
+      expect(await opened(ui)).toEqual(['src/lib/x.ts'])
+      // Pressed together, the second key reads what the first folded.
+      await personFocus($, 'dir:src')
+      await Promise.all([ui.press({ key: 'nav:h' }), ui.press({ key: 'nav:l' })])
+      expect(await rowKeys(ui)).toEqual(TREE_KEYS)
+      await ui.press({ key: 'collapse' })
+      await ui.unmount()
+    }
+  })
+
+  test('l opens a diff at once and the next key does not wait for git to read it', async ($, on) => {
+    const { state } = world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...FOCUSED_PANE, surface: 'terminal' })
+    const held = gate()
+    const reached = gate()
+    state.hold = held.promise
+    state.onHold = reached.open
+    await personFocus($, 'file:a.txt')
+    const loading = ui.press({ key: 'nav:l' })
+    await reached.promise
+    // While git reads a.txt, h folds the directory the ring moved to.
+    await personFocus($, 'dir:src')
+    const folding = keys(ui, 'h')
+    // Behind the load, h would wait for git, which stays held: a second is ample.
+    const { setTimeout } = globalThis as unknown as { setTimeout: (run: () => void, ms: number) => unknown }
+    const isLate = await Promise.race([
+      folding.then(() => false),
+      new Promise<boolean>(resolve => setTimeout(() => resolve(true), 1_000)),
+    ])
+    expect(isLate).toBe(false)
+    expect(await rowKeys(ui)).not.toContain('dir:src/lib')
+    state.hold = undefined
+    held.open()
+    await loading
+    expect(await opened(ui)).toEqual(['a.txt'])
+    await ui.press({ key: 'dir:src' })
+    await ui.press({ key: 'collapse' })
+    await ui.unmount()
+  })
+
+  test('a move the engine refuses, or cannot make, is dropped and nothing throws', async ($, on) => {
+    world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    // The kit has no `$.ui.focus` beneath a mod: each move there is a failed one.
+    const ui = await $.ui.mount({ ...FOCUSED_PANE, surface: 'terminal' })
+    await personFocus($, 'file:src/lib/x.ts')
+    await keys(ui, 'jkgeh')
+    expect(await rowKeys(ui)).toEqual(TREE_KEYS)
+    await ui.unmount()
+
+    // As the engine answers: a refusal, a failure, a scroll that fails.
+    const asked: string[] = []
+    const engine = (focus: () => Promise<unknown>, scroll: () => Promise<unknown> = async () => ({})) =>
+      ({
+        ui: {
+          focus: async (args: { key: string }) => {
+            asked.push(`focus ${args.key}`)
+            return focus()
+          },
+          scroll: async (args: unknown) => {
+            asked.push(`scroll ${JSON.stringify(args)}`)
+            return scroll()
+          },
+        },
+      }) as never
+    await focusRow(engine(async () => ({ deny: 'the pane does not hold the keys' })), 'file:a.txt')
+    expect(asked).toEqual(['focus file:a.txt'])
+    await focusRow(engine(async () => Promise.reject(new Error('no surface'))), 'file:a.txt')
+    expect(asked).toHaveLength(2)
+    await focusRow(engine(async () => ({}), async () => Promise.reject(new Error('no surface'))), 'file:a.txt')
+    expect(asked.slice(2)).toEqual(['focus file:a.txt', 'scroll {"to":{"key":"file:a.txt"},"in":"worktree-diff"}'])
+    await focusRow(engine(async () => ({}), async () => ({ deny: 'nothing to scroll' })), 'file:bin.dat')
+    expect(asked.at(-1)).toBe('scroll {"to":{"key":"file:bin.dat"},"in":"worktree-diff"}')
+    // g goes back to the pane's start, the header and the key hints with it, then shows the row.
+    await focusRow(engine(async () => ({})), 'dir:deep/a/b', true)
+    expect(asked.slice(-3)).toEqual([
+      'focus dir:deep/a/b',
+      'scroll {"to":"start","in":"worktree-diff"}',
+      'scroll {"to":{"key":"dir:deep/a/b"},"in":"worktree-diff"}',
+    ])
+    // A start that fails still shows the row.
+    const before = asked.length
+    await focusRow(engine(async () => ({}), async () => Promise.reject(new Error('no surface'))), 'dir:deep/a/b', true)
+    expect(asked.slice(before)).toEqual([
+      'focus dir:deep/a/b',
+      'scroll {"to":"start","in":"worktree-diff"}',
+      'scroll {"to":{"key":"dir:deep/a/b"},"in":"worktree-diff"}',
+    ])
+  })
+
+  test('keys pressed faster than the ring moves run in turn, each from where the last left it', async () => {
+    // The kit runs the mod apart from this import, so the turns are watched on a stand-in ring.
+    let ring = 0
+    const moves: string[] = []
+    const press = (step: number) => async () => {
+      const from = ring
+      // A move lands a few ticks after it is asked, as one over IPC does.
+      for (let tick = 0; tick < 5; tick++) await Promise.resolve()
+      ring = from + step
+      moves.push(`${from}→${ring}`)
+    }
+    await Promise.all([inTurn(press(1)), inTurn(press(1)), inTurn(press(-1))])
+    expect(moves).toEqual(['0→1', '1→2', '2→1'])
+    // One that fails leaves the next to run.
+    await Promise.all([inTurn(async () => Promise.reject(new Error('gone'))), inTurn(press(1))])
+    expect(moves.at(-1)).toBe('1→2')
+  })
+
+  test('the ring starts on the row it last held, else the first; with no rows, nowhere', async ($, on) => {
+    const { state } = world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      expect(await autoFocused(ui)).toBe(TREE_KEYS[0])
+      await personFocus($, 'file:src/lib/x.ts')
+      await ui.redraw()
+      expect(await autoFocused(ui)).toBe('file:src/lib/x.ts')
+      // A control the ring moved to since is not where it starts again.
+      await personFocus($, 'refresh')
+      await ui.redraw()
+      expect(await autoFocused(ui)).toBe('file:src/lib/x.ts')
+      // Folded out of sight, that row is gone: the first takes it.
+      await ui.press({ key: 'dir:src' })
+      expect(await autoFocused(ui)).toBe(TREE_KEYS[0])
+      await ui.press({ key: 'dir:src' })
+      await personFocus($, TREE_KEYS[0])
+      await ui.unmount()
+    }
+
+    // Nothing listed.
+    state.table = featTable({
+      [`diff --numstat -z -M ${MB} --`]: ok(''),
+      [`diff --name-status -z -M ${MB} --`]: ok(''),
+      [`diff --name-only -z --no-renames ${MB} HEAD --`]: ok(''),
+      'diff --name-only -z --no-renames HEAD --': ok(''),
+      'ls-files --others --exclude-standard -z': ok(''),
+    })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...FOCUSED_PANE, surface })
+      expect(await autoFocused(ui)).toBeUndefined()
+      // The keys do nothing, and nothing throws.
+      await keys(ui, 'jkghle')
+      await ui.unmount()
+    }
+  })
+
+  test('the keys show while the pane holds the keyboard; before, the terminal says how to give it', async ($, on) => {
+    world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const idle = await $.ui.mount({ ...PANE, surface })
+      expect(await idle.find({ key: 'nav:j' })).toBeUndefined()
+      const hint = await idle.find({ type: 'Text', text: 'ctrl+x tab to focus' })
+      if (surface === 'terminal') expect(hint?.props).toMatchObject({ dimColor: true })
+      else expect(hint).toBeUndefined()
+      await idle.unmount()
+
+      const ui = await $.ui.mount({ ...FOCUSED_PANE, surface })
+      expect(await ui.find({ type: 'Text', text: 'ctrl+x tab to focus' })).toBeUndefined()
+      const buttons = await ui.findAll({ type: 'Button' })
+      const nav = buttons.filter(button => button.key?.startsWith('nav:'))
+      expect(nav.map(button => [button.props.hotkey, button.props.label])).toEqual([
+        ['j', 'down'],
+        ['k', 'up'],
+        ['h', 'fold'],
+        ['l', 'open'],
+        ['g', 'top'],
+        ['e', 'end'],
+        ['q', 'close'],
+      ])
+      for (const button of nav) expect(button.props).toMatchObject({ plain: true, dimColor: true })
+      expect((await ui.find({ type: 'Text', text: 'esc: back' }))?.props).toMatchObject({ dimColor: true })
+      // No two Buttons share a hotkey: the later would win.
+      await ui.press({ key: 'file:a.txt' })
+      const hotkeys = (await ui.findAll({ type: 'Button' })).map(button => button.props.hotkey).filter(Boolean)
+      expect(hotkeys).toContain('x')
+      expect(new Set(hotkeys).size).toBe(hotkeys.length)
+      await ui.press({ key: 'collapse' })
+      if (surface === 'terminal') {
+        // The end of the pane, wrapped at 60 columns.
+        expect((await screen(ui, 60)).slice(-3).map(line => line.trimEnd())).toEqual([
+          '',
+          'j: down  k: up  h: fold  l: open  g: top  e: end  q: close',
+          'esc: back',
+        ])
+      }
+      await ui.unmount()
+    }
+  })
+
+  test('past the window the keys sit under the controls, where they cannot scroll out of reach', async ($, on) => {
+    world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      for (const isFocused of [true, false]) {
+        const props = { ...PANE.props, isFocused }
+        // Everything fits in 40 rows: the keys come last.
+        const roomy = await $.ui.mount({ ...PANE, props, surface })
+        let drawn = order(await roomy.drawn())
+        if (isFocused) expect(drawn.slice(-7)).toEqual(['nav:j', 'nav:k', 'nav:h', 'nav:l', 'nav:g', 'nav:e', 'nav:q'])
+        if (!isFocused && surface === 'terminal') {
+          expect((await screen(roomy, 60)).at(-1)?.trimEnd()).toBe('ctrl+x tab to focus')
+        }
+        await roomy.unmount()
+
+        const tight = await $.ui.mount({ ...PANE, props: { ...props, scroll: { offset: 0, bodyRows: 12 } }, surface })
+        drawn = order(await tight.drawn())
+        if (isFocused) {
+          const at = drawn.indexOf('nav:j')
+          expect(drawn.slice(at - 1, at + 8)).toEqual(['fold', 'nav:j', 'nav:k', 'nav:h', 'nav:l', 'nav:g', 'nav:e', 'nav:q', 'mode:all'])
+        }
+        if (surface === 'terminal') {
+          const lines = (await screen(tight, 60)).map(line => line.trimEnd())
+          // Under the controls, then a blank line, then the tabs.
+          expect(lines[2]).toBe('r: refresh  t: list  z: fold')
+          expect(lines.slice(3, 6)).toEqual(
+            isFocused
+              ? ['j: down  k: up  h: fold  l: open  g: top  e: end  q: close', 'esc: back', '']
+              : ['ctrl+x tab to focus', '', 'a: all   c: committed   u: uncommitted'],
+          )
+        }
+        await tight.unmount()
+      }
+    }
+  })
+
+  test('the keys stay at the end only with rows to spare, so a surface that draws one more cannot hide them', async ($, on) => {
+    world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    const isAtEnd = (lines: string[]) => /(^ctrl\+x tab to focus|esc: back)$/.test(lines.at(-1)?.trimEnd() ?? '')
+    for (const columns of [30, 42, 60]) {
+      for (const isFocused of [true, false]) {
+        for (const isOpened of [false, true]) {
+          const props = { ...PANE.props, bodyColumns: columns, isFocused }
+          const ui = await $.ui.mount({ ...PANE, props, surface: 'terminal' })
+          if (isOpened) for (const key of ['file:a.txt', 'file:src/lib/x.ts']) await ui.press({ key })
+          await ui.redraw({ ...props, scroll: { offset: 0, bodyRows: 400 } })
+          const painted = await screen(ui, columns)
+          expect(isAtEnd(painted)).toBe(true)
+          // Out by one: the keys would be the row past the window. Exactly fitting: no row to spare.
+          for (const bodyRows of [painted.length - 1, painted.length + 1]) {
+            await ui.redraw({ ...props, scroll: { offset: 0, bodyRows } })
+            expect(isAtEnd(await screen(ui, columns))).toBe(false)
+          }
+          await ui.unmount()
+        }
+      }
+    }
+  })
+
+  test('q closes the pane', async ($, on) => {
+    const { state } = world(on, { table: treeTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      state.isOpen = true
+      const ui = await $.ui.mount({ ...FOCUSED_PANE, surface })
+      await keys(ui, 'q')
+      expect(state.isOpen).toBe(false)
+      await ui.unmount()
+    }
+  })
+
+  test('the usage names close', async ($, on) => {
+    world(on)
+    expect(USAGE).toContain('/wt-diff close')
+    expect((await wtDiff($, 'nope')).text).toBe(USAGE)
+  })
+})
+
 describe('/wt-diff', () => {
   test('status refreshes and answers the summary', async ($, on) => {
     const { state } = world(on, { isOpen: false })
@@ -1254,28 +2191,58 @@ describe('/wt-diff', () => {
     expect(text).toContain('6 files · +6 -3')
   })
 
-  test('no argument toggles the pane', async ($, on) => {
+  test('no argument opens the pane and asks for the keyboard, again and again; close closes it', async ($, on) => {
     const { state } = world(on, { isOpen: false })
-    expect((await wtDiff($)).text).toBe('Changes pane opened.')
+    expect((await wtDiff($)).text).toBe('Changes pane focused — j/k move · enter open · esc back · q close')
     expect(state.opened).toBe(1)
-    expect((await wtDiff($, '')).text).toBe('Changes pane closed.')
+    expect(state.openArgs.at(-1)).toMatchObject({ id: 'worktree-diff', focus: true })
+    // On screen already: focused again, not closed.
+    expect((await wtDiff($, '')).text).toBe(FOCUSED)
+    expect(state.opened).toBe(2)
+    expect(state.openArgs.at(-1)).toMatchObject({ focus: true })
+    expect(state.isOpen).toBe(true)
+
+    expect((await wtDiff($, 'close')).text).toBe('Changes pane closed.')
     expect(state.isOpen).toBe(false)
+    expect((await wtDiff($, 'close')).text).toBe('Changes pane is not open.')
+    expect((await wtDiff($, 'close now')).text).toBe(USAGE)
   })
 
-  test('a pane open but undrawn on a narrow terminal is opened, not closed', async ($, on) => {
+  test('the pane opens with a transparent backdrop by default', async ($, on) => {
+    const { state } = world(on, { isOpen: false })
+    await wtDiff($)
+    expect(state.openArgs.at(-1)).toMatchObject({ id: 'worktree-diff', backgroundColor: 'transparent' })
+  })
+
+  test('paneBackground theme leaves the surface its own fill', { options: { paneBackground: 'theme' } }, async ($, on) => {
+    const { state } = world(on, { isOpen: false })
+    await wtDiff($)
+    expect(state.openArgs.at(-1)).not.toHaveProperty('backgroundColor')
+  })
+
+  test('a pane open but undrawn on a narrow terminal is placed and focused', async ($, on) => {
     const { state } = world(on, { isOpen: true, isPlaced: false })
-    expect((await wtDiff($)).text).toBe('Changes pane opened.')
+    expect((await wtDiff($)).text).toBe(FOCUSED)
     expect(state.opened).toBe(1)
+    expect(state.openArgs.at(-1)).toMatchObject({ id: 'worktree-diff', focus: true })
     expect(state.isPlaced).toBe(true)
   })
 
-  test('a pane that is a tab behind another is raised, not closed', async ($, on) => {
+  test('a pane the engine opens without the keyboard says how to give it', async ($, on) => {
+    const { state } = world(on, { isOpen: false })
+    state.grantsFocus = false
+    expect((await wtDiff($)).text).toBe('Changes pane opened — ctrl+x tab to focus')
+    expect(state.isOpen).toBe(true)
+    expect(state.openArgs.at(-1)).toMatchObject({ focus: true })
+    state.grantsFocus = true
+    expect((await wtDiff($)).text).toBe(FOCUSED)
+  })
+
+  test('a pane that is a tab behind another is raised and focused', async ($, on) => {
     const { state } = world(on, { isOpen: true, isPlaced: true, isShown: false })
-    expect((await wtDiff($)).text).toBe('Changes pane opened.')
+    expect((await wtDiff($)).text).toBe(FOCUSED)
     expect(state.isOpen).toBe(true)
     expect(state.openArgs.at(-1)).toMatchObject({ id: 'worktree-diff', focus: true })
-    // Shown now: the next /wt-diff closes it.
-    expect((await wtDiff($)).text).toBe('Changes pane closed.')
   })
 
   test('base <ref> is checked, stored per worktree and used; base alone clears it', async ($, on) => {
@@ -1459,9 +2426,9 @@ describe('/wt-diff', () => {
       ].join('\n'),
     )
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    const drawn = JSON.stringify(await ui.drawn())
-    expect(drawn).toContain('feat/x → origin/feat/x')
-    expect(drawn).toContain('upstream · 2d46dcc')
+    const lines = await screen(ui, 60)
+    expect(lines[0]).toMatch(/^feat\/x +↑2 ↓1$/)
+    expect(lines[1]).toMatch(/^vs origin\/feat\/x +upstream · 2d46dcc$/)
     expect(await rowKeys(ui)).toEqual([
       'dir:docs',
       'file:docs/a.md',
@@ -1488,6 +2455,183 @@ describe('/wt-diff', () => {
     for (const args of ['mode', 'mode sideways', 'bogus', 'base a b']) {
       expect((await wtDiff($, args)).text).toBe(USAGE)
     }
+  })
+})
+
+// ---------------------------------------------------------------- layout
+
+const RENAME_DIFF = ok(
+  'diff --git a/src/old name.txt b/src/new näme.txt\nsimilarity index 94%\n' +
+    'rename from src/old name.txt\nrename to src/new näme.txt\n@@ -1,2 +1,3 @@\n one\n two\n+three\n',
+)
+const LONG_BRANCH = 'feat/HAR-123-polish-the-changes-pane-header'
+const LONG_REF = 'origin/release/2026-10-the-long-integration-branch'
+
+describe('layout', () => {
+  test('the rule marks the current tab at 55 columns; at 36 the tabs wrap and its label is underlined', async ($, on) => {
+    world(on)
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 55 } })
+    for (const mode of ['committed', 'uncommitted', 'all'] as const) {
+      await ui.press({ key: `mode:${mode}` })
+      const lines = await screen(ui, 55)
+      const at = lines.findIndex(line => line.startsWith('a: all'))
+      expect(lines[at]?.trimEnd()).toBe('a: all   c: committed   u: uncommitted')
+      const rule = lines[at + 1] ?? ''
+      expect(rule).toMatch(/^─*━+─*$/)
+      expect(cellWidth(rule)).toBe(55)
+      // Right under the current tab's own cells: its hotkey, the colon and the label.
+      const [from, to] = [rule.indexOf('━'), rule.lastIndexOf('━') + 1]
+      expect(lines[at]?.slice(from, to)).toBe(`${mode[0]}: ${mode}`)
+      expect((await ui.find({ type: 'Text', text: /━/ }))?.props).toMatchObject({ color: 'suggestion' })
+      expect((await ui.find({ type: 'Text', text: /─/ }))?.props).toMatchObject({ color: 'subtle' })
+      expect((await ui.find({ key: `mode:${mode}` }))?.children).toEqual([
+        { type: 'Text', props: { weight: 'semibold' }, children: [mode] },
+      ])
+    }
+    await ui.unmount()
+
+    const narrow = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 36 } })
+    const lines = await screen(narrow, 36)
+    const at = lines.findIndex(line => line.startsWith('a: all'))
+    expect(lines.slice(at, at + 3).map(line => line.trimEnd())).toEqual([
+      'a: all   c: committed',
+      'u: uncommitted',
+      '─'.repeat(36),
+    ])
+    expect((await narrow.find({ key: 'mode:all' }))?.children).toEqual([
+      { type: 'Text', props: { weight: 'semibold', underline: true }, children: ['all'] },
+    ])
+    await narrow.unmount()
+
+    // Elsewhere the surface marks the primary button itself: no rule.
+    const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    expect(await desktop.find({ type: 'Text', text: /[━─]/ })).toBeUndefined()
+    await desktop.unmount()
+  })
+
+  test('the summary follows the mode, its legend short under 46 columns', async ($, on) => {
+    world(on)
+    await wtDiff($, 'refresh')
+    const summaryAt = async (columns: number) => {
+      const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: columns } })
+      const line = (await screen(ui, columns)).find(row => /^\d+ files? /.test(row)) ?? ''
+      await ui.unmount()
+      return line
+    }
+    expect(await summaryAt(55)).toBe(`7 files  ● 4 uncommitted${' '.repeat(26)}+8 −3`)
+    expect(await summaryAt(42)).toBe(`7 files  ● 4${' '.repeat(25)}+8 −3`)
+    await wtDiff($, 'mode uncommitted')
+    expect(await summaryAt(42)).toBe(`4 files${' '.repeat(30)}+5 −0`)
+  })
+
+  test('a top-level row after a nested one starts a group, unless a diff already parts them', async ($, on) => {
+    world(on, { table: featTable({ [`diff -M ${MB} -- :(literal)src/new näme.txt :(literal)src/old name.txt`]: RENAME_DIFF }) })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 55 } })
+    const before = (lines: string[], start: string) => {
+      const at = lines.findIndex(line => line.startsWith(start))
+      return [lines[at - 2] ?? '', lines[at - 1] ?? ''].map(line => line.trimEnd())
+    }
+    let lines = await screen(ui, 55)
+    expect(before(lines, '▾ dir/')[1]).toMatch(/^7 files/)
+    expect(before(lines, '▾ src/')[1]).toBe('')
+    expect(before(lines, 'M ● a.txt')[1]).toBe('')
+    expect(before(lines, 'A   bin.dat')[1]).toMatch(/^M ● a\.txt/)
+
+    // The diff's own margin parts it from the next group: one blank, not two.
+    await ui.press({ key: 'file:src/new näme.txt' })
+    lines = await screen(ui, 55)
+    const [twoUp, oneUp] = before(lines, 'M ● a.txt')
+    expect(oneUp).toBe('')
+    expect(twoUp).not.toBe('')
+    // The diff starts under the name.
+    const name = lines.findIndex(line => line.includes('new näme.txt'))
+    expect(lines[name + 1]?.indexOf('@@')).toBe(lines[name]?.indexOf('new näme.txt'))
+    await ui.unmount()
+  })
+
+  test('no line is wider than the pane at 42, 55 and 75 columns, in either view and every mode', async ($, on) => {
+    const long = 'src/components/settings/notifications/EmailDigestPreferencesPanel.tsx'
+    world(on, {
+      table: treeTable({
+        'symbolic-ref --short -q HEAD': ok(`${LONG_BRANCH}\n`),
+        [`rev-parse --verify --quiet ${LONG_REF}^{commit}`]: ok(`${MAIN_SHA}\n`),
+        [`merge-base ${LONG_REF} HEAD`]: ok(`${MB}\n`),
+        [`rev-list --left-right --count ${LONG_REF}...HEAD`]: ok('12\t345\n'),
+        'ls-files --others --exclude-standard -z': ok(`${UNTRACKED}deep/a/b/c.md\0deep/a/b/d.md\0src/lib/x.ts\0${long}\0`),
+        [`diff -M ${MB} -- :(literal)src/new näme.txt :(literal)src/old name.txt`]: RENAME_DIFF,
+        'diff --no-index -- /dev/null src/lib/x.ts': {
+          exitCode: 1,
+          stdout: `diff --git a/src/lib/x.ts b/src/lib/x.ts\n@@ -0,0 +1,4 @@\n+${'x'.repeat(120)}\n+2\n+3\n+4\n`,
+        },
+      }),
+      files: { ...treeFiles, [`${ROOT}/${long}`]: 'a\n'.repeat(1234) },
+      store: { [`base:${ROOT}`]: LONG_REF },
+    })
+    await wtDiff($, 'refresh')
+    let isOpened = false
+    for (const view of ['tree', 'list']) {
+      for (const columns of [42, 55, 75]) {
+        const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: columns } })
+        if (view === 'list' && (await ui.find({ key: 'view' }))?.props.label === 'list') await ui.press({ key: 'view' })
+        if (!isOpened) {
+          for (const key of ['file:a.txt', 'file:src/lib/x.ts', 'file:src/new näme.txt', 'dir:dir']) await ui.press({ key })
+          isOpened = true
+        }
+        for (const mode of ['all', 'committed', 'uncommitted'] as const) {
+          await ui.press({ key: `mode:${mode}` })
+          const lines = await screen(ui, columns)
+          for (const line of lines) {
+            if (cellWidth(line) > columns) throw new Error(`${view} ${mode} at ${columns}: ${JSON.stringify(line)}`)
+          }
+          // The keys, under the controls or at the end, wrap within the pane too.
+          for (const bodyRows of [8, 400]) {
+            await ui.redraw({ ...PANE.props, bodyColumns: columns, isFocused: true, scroll: { offset: 0, bodyRows } })
+            for (const line of await screen(ui, columns)) {
+              if (cellWidth(line) > columns) throw new Error(`focused ${view} ${mode} at ${columns}: ${JSON.stringify(line)}`)
+            }
+          }
+          await ui.redraw({ ...PANE.props, bodyColumns: columns })
+          // The branch row and the summary reach the edge: their right sides line up.
+          expect(cellWidth(lines[0] ?? '')).toBe(columns)
+          expect(lines[0]).toMatch(/ ↑345 ↓12$/)
+          expect(cellWidth(lines.find(line => /^\d+ files? /.test(line)) ?? '')).toBe(columns)
+        }
+        await ui.unmount()
+      }
+    }
+  })
+
+  test('the header cuts the branch in the middle and gives up where the base came from before the ref', async ($, on) => {
+    world(on, {
+      table: featTable({
+        'symbolic-ref --short -q HEAD': ok(`${LONG_BRANCH}\n`),
+        [`rev-parse --verify --quiet ${LONG_REF}^{commit}`]: ok(`${MAIN_SHA}\n`),
+        [`merge-base ${LONG_REF} HEAD`]: ok(`${MB}\n`),
+        [`rev-list --left-right --count ${LONG_REF}...HEAD`]: ok('0\t3\n'),
+      }),
+      store: { [`base:${ROOT}`]: LONG_REF },
+    })
+    await wtDiff($, 'refresh')
+    const header = async (columns: number) => {
+      const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: columns } })
+      const lines = (await screen(ui, columns)).slice(0, 2)
+      await ui.unmount()
+      return lines
+    }
+    expect(await header(75)).toEqual([
+      `${LONG_BRANCH}${' '.repeat(75 - LONG_BRANCH.length - 5)}↑3 ↓0`,
+      `vs ${LONG_REF}${' '.repeat(75 - 3 - LONG_REF.length - 18)}override · 73481c5`,
+    ])
+    // Where the base came from goes first, then the sha; the ref stays whole while it fits.
+    expect(await header(62)).toEqual([
+      `${LONG_BRANCH}${' '.repeat(62 - LONG_BRANCH.length - 5)}↑3 ↓0`,
+      `vs ${LONG_REF}  73481c5`,
+    ])
+    expect(await header(55)).toEqual([`${LONG_BRANCH}${' '.repeat(55 - LONG_BRANCH.length - 5)}↑3 ↓0`, `vs ${LONG_REF}`])
+    // Then both are cut in the middle, ↑↓ kept.
+    expect(await header(42)).toEqual(['feat/HAR-123-pol…nges-pane-header    ↑3 ↓0', 'vs …/2026-10-the-long-integration-branch'])
   })
 })
 
@@ -1533,7 +2677,7 @@ describe('refresh', () => {
     await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/a.txt`, old_string: 'extra', new_string: 'EXTRA' })
     await clock.advance(300)
     await clock.settle()
-    expect(String((await ui.find({ type: 'Code' }))?.props.source)).toContain('+EXTRA')
+    expect(await diffOf(ui, 'a.txt')).toContain('+ EXTRA')
 
     // a.txt reverted: its row and its open diff go.
     state.table = featTable({
@@ -1545,7 +2689,7 @@ describe('refresh', () => {
     await clock.advance(300)
     await clock.settle()
     expect(await ui.find({ key: 'file:a.txt' })).toBeUndefined()
-    expect(await ui.find({ type: 'Code' })).toBeUndefined()
+    expect(await opened(ui)).toEqual([])
     expect(await ui.find({ key: 'file:keep.txt' })).toBeDefined()
     await ui.unmount()
   })
@@ -1598,8 +2742,8 @@ describe('refresh', () => {
   test('closing the pane stops the polling', async ($, on) => {
     const { state, clock } = world(on)
     await wtDiff($, 'refresh')
-    // The kit raises events, not `$.ui.close`: close it the way /wt-diff does.
-    expect((await wtDiff($)).text).toBe('Changes pane closed.')
+    // The kit raises events, not `$.ui.close`: close it the way /wt-diff close does.
+    expect((await wtDiff($, 'close')).text).toBe('Changes pane closed.')
     const calls = state.calls.length
     const panes = state.panesCalls
     await clock.advance(10_000)
@@ -1658,10 +2802,123 @@ describe('refresh', () => {
     await ui.unmount()
   })
 
-  test('statusLine shows the totals', { options: { statusLine: true } }, async ($, on) => {
+  test('statusLine ends the terminal hint line with the totals, kept current', { options: { statusLine: true } }, async ($, on) => {
+    const { state, clock } = world(on, { isOpen: false })
+    const hint = await $.ui.mount({
+      plugin: 'worktree-diff',
+      surface: 'terminal',
+      component: 'PromptHint',
+      props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+      viewport: { columns: 160, rows: 40, isFullscreen: true },
+    })
+    // Nothing read yet: the line as the engine has it.
+    expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts')
+    await wtDiff($, 'refresh')
+    expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts · 7 files +8 −3')
+    // The terminal alone: no status line besides.
+    expect(state.statuses.filter(text => text !== undefined)).toEqual([])
+
+    // The pane closed, an edit still updates it.
+    state.table = featTable({
+      [`diff --numstat -z -M ${MB} --`]: ok('1\t0\tkeep.txt\0'),
+      [`diff --name-status -z -M ${MB} --`]: ok('M\0keep.txt\0'),
+      'ls-files --others --exclude-standard -z': ok(''),
+    })
+    await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/a.txt`, old_string: 'a', new_string: 'b' })
+    await clock.advance(300)
+    await clock.settle()
+    expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts · 1 file +1 −0')
+    await hint.unmount()
+  })
+
+  test('statusLine off leaves the hint line alone', async ($, on) => {
     const { state } = world(on, { isOpen: false })
     await wtDiff($, 'refresh')
-    expect(state.statuses.at(-1)).toBe('wt +8 −3')
+    const hint = await $.ui.mount({
+      plugin: 'worktree-diff',
+      surface: 'terminal',
+      component: 'PromptHint',
+      props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+    })
+    expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts')
+    expect(state.statuses.filter(text => text !== undefined)).toEqual([])
+    await hint.unmount()
+  })
+
+  test(
+    'statusLine uses the status line where a surface draws no tail, and a reload clears an old one',
+    { options: { statusLine: true } },
+    async ($, on) => {
+      const { state } = world(on, { isOpen: false, surfaces: ['terminal', 'desktop'] })
+      await wtDiff($, 'refresh')
+      expect(state.statuses.at(-1)).toBe('7 files +8 −3')
+      // The desktop draws no tail: its hint line is left as it is.
+      const hint = await $.ui.mount({
+        plugin: 'worktree-diff',
+        surface: 'desktop',
+        component: 'PromptHint',
+        props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+      })
+      expect((await hint.find({ type: 'Text' }))?.text).toBe('? for shortcuts')
+      await hint.unmount()
+      // Same totals: not set again.
+      const count = state.statuses.length
+      await wtDiff($, 'refresh')
+      expect(state.statuses.length).toBe(count)
+
+      // A reload clears what an earlier load left, then sets it again while the desktop is attached.
+      await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+      await wtDiff($, 'refresh')
+      expect(state.statuses.slice(count)).toEqual([undefined, '7 files +8 −3'])
+
+      // With the terminal alone it clears and is not set again.
+      const after = state.statuses.length
+      state.surfaces = ['terminal']
+      await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+      expect(state.statuses.at(-1)).toBeUndefined()
+      await wtDiff($, 'refresh')
+      expect(state.statuses.slice(after)).toEqual([undefined])
+    },
+  )
+
+  test(
+    'statusLine follows a surface joining or leaving an idle session, with no refresh between',
+    { options: { statusLine: true } },
+    async ($, on) => {
+      const { state, clock } = world(on, { isOpen: false })
+      await wtDiff($, 'refresh')
+      expect(state.statuses.filter(text => text !== undefined)).toEqual([])
+
+      state.surfaces = ['terminal', 'mobile']
+      await $.session.attach({ surface: 'mobile', clientId: 'mobile:default' })
+      await clock.settle()
+      expect(state.statuses.at(-1)).toBe('7 files +8 −3')
+
+      state.surfaces = ['terminal']
+      await $.session.detach({ surface: 'mobile', clientId: 'mobile:default', reason: 'detach' })
+      await clock.settle()
+      expect(state.statuses.at(-1)).toBeUndefined()
+      const count = state.statuses.length
+
+      // The session ending leaves it be.
+      state.surfaces = ['terminal', 'mobile']
+      await $.session.attach({ surface: 'mobile', clientId: 'mobile:default' })
+      await clock.settle()
+      const shown = state.statuses.length
+      expect(shown).toBe(count + 1)
+      await $.session.detach({ surface: 'mobile', clientId: 'mobile:default', reason: 'end' })
+      await clock.settle()
+      expect(state.statuses.length).toBe(shown)
+    },
+  )
+
+  test('statusLine off ignores a surface joining', async ($, on) => {
+    const { state, clock } = world(on, { isOpen: false })
+    await wtDiff($, 'refresh')
+    state.surfaces = ['terminal', 'mobile']
+    await $.session.attach({ surface: 'mobile', clientId: 'mobile:default' })
+    await clock.settle()
+    expect(state.statuses.filter(text => text !== undefined)).toEqual([])
   })
 })
 
@@ -1702,7 +2959,7 @@ describe('auto-open', () => {
     await clock.advance(300)
     await clock.settle()
     expect(state.opened).toBe(0)
-    expect((await wtDiff($)).text).toBe('Changes pane opened.')
+    expect((await wtDiff($)).text).toBe(FOCUSED)
   })
 
   test('a reload does not open it again, nor does a non-interactive start', async ($, on) => {
@@ -1715,11 +2972,17 @@ describe('auto-open', () => {
     await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
     await clock.settle()
     expect(state.opened).toBe(1)
+    // A reload with the pane on screen opens it again so a new backdrop applies.
+    await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    expect(state.opened).toBe(2)
+    expect(state.openArgs.at(-1)).toMatchObject({ backgroundColor: 'transparent' })
+    expect(state.openArgs.at(-1)).not.toHaveProperty('focus')
     // The person closes it; the hot reload's session.start finds a snapshot.
     state.isOpen = false
     await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
     await clock.settle()
-    expect(state.opened).toBe(1)
+    expect(state.opened).toBe(2)
   })
 
   test('the main checkout does not, under the default', async ($, on) => {

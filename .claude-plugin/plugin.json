@@ -1,6 +1,6 @@
 {
   "name": "worktree-diff",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A side pane showing what the current git worktree changed versus the branch it came from",
   "author": { "name": "sudoviber", "url": "https://github.com/sudoviber" },
   "license": "MIT",
@@ -23,9 +23,23 @@
     },
     "statusLine": {
       "type": "boolean",
-      "title": "Show totals in the status line",
-      "description": "Shows `wt +added −removed` in the status line after each refresh",
+      "title": "Show totals under the prompt",
+      "description": "Shows `5 files +added −removed` at the end of the hint line under the prompt (the status line on other surfaces), even while the pane is closed",
       "default": false
+    },
+    "diffStyle": {
+      "type": "string",
+      "title": "How an open diff is drawn",
+      "description": "quiet: changed lines in green and red text, no background; engine: Claude Code's own diff view, with syntax colours and line numbers",
+      "default": "quiet",
+      "options": ["quiet", "engine"]
+    },
+    "paneBackground": {
+      "type": "string",
+      "title": "Pane background",
+      "description": "transparent: the terminal's own background shows through the pane; theme: Claude Code's pane fill",
+      "default": "transparent",
+      "options": ["transparent", "theme"]
     }
   }
 }
