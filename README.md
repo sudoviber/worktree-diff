@@ -1,5 +1,7 @@
 # worktree-diff
 
+English | [简体中文](README.zh-CN.md)
+
 A Claude Code mod that docks a **Changes** pane beside the conversation. It shows what the
 current git worktree changed compared with the branch it was created from: every file with
 its added and removed line counts, and the unified diff of any file you open. The pane
