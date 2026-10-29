@@ -1,0 +1,31 @@
+{
+  "name": "worktree-diff",
+  "version": "0.1.0",
+  "description": "A side pane showing what the current git worktree changed versus the branch it came from",
+  "author": { "name": "sudoviber", "url": "https://github.com/sudoviber" },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoOpen": {
+      "type": "string",
+      "title": "Auto-open the Changes pane",
+      "description": "worktree: when the session is in a linked git worktree; always: in any git repository; never: only with /wt-diff",
+      "default": "worktree",
+      "options": ["worktree", "always", "never"]
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Poll interval (seconds)",
+      "description": "How often the open pane re-reads git to catch edits made outside Claude; 0 turns polling off",
+      "default": 5,
+      "min": 0,
+      "max": 3600
+    },
+    "statusLine": {
+      "type": "boolean",
+      "title": "Show totals in the status line",
+      "description": "Shows `wt +added −removed` in the status line after each refresh",
+      "default": false
+    }
+  }
+}

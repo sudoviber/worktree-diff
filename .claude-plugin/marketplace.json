@@ -1,0 +1,6 @@
+{
+  "name": "worktree-diff",
+  "owner": { "name": "sudoviber" },
+  "description": "Claude Code mods for working in git worktrees",
+  "plugins": [{ "name": "worktree-diff", "source": "./" }]
+}
