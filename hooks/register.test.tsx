@@ -1,21 +1,33 @@
-import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
+import { describe, expect, mock, test as kitTest, type Engine, type TestBody, type TestOptions } from 'claude-code/testing'
 import type { On, RenderSurface } from 'claude-code'
 
 import {
   cellWidth,
   fitPath,
   FOCUSED,
+  FOCUSED_SIDE,
   focusRow,
   inTurn,
+  keepRecent,
+  keptCursor,
   navAction,
   oneLine,
   printable,
   readConfig,
+  sideRing,
   statusLineText,
   USAGE,
   type NavRow,
 } from './register'
 import type { RunResult } from './git'
+
+/** v0.3's tests: the inline view, each opened file under its row, unless a test says otherwise. */
+const test = (name: string, ...rest: readonly [TestBody] | readonly [TestOptions, TestBody]) => {
+  const [given, body] = rest.length === 1 ? [{}, rest[0]] : rest
+  kitTest(name, { ...given, options: { diffView: 'inline', ...given.options } }, body)
+}
+/** The side view, the default. */
+const sideTest = kitTest
 
 // Real git 2.54 output from the throwaway feat worktree git.test.ts describes:
 // commits on feat edit a.txt, rename "src/old name.txt", delete gone.txt and
@@ -164,6 +176,8 @@ const world = (on: On, given: World = {}) => {
     /** Whether an open asking for the keyboard gets it: false as over text in the composer. */
     grantsFocus: true,
     isFocused: false,
+    /** The moves of the pane's body that reached the engine. */
+    scrolls: [] as unknown[],
   }
   const clock = mock.clock(on, { now: 1_000 })
   // As mock.store, but open to the test.
@@ -260,6 +274,10 @@ const world = (on: On, given: World = {}) => {
   on('turn.complete', () => ({ text: '' }))
   // The person's move of the pane's ring, raised by a test, lands where it is asked.
   on('ui.focus', () => ({}))
+  on('ui.scroll', (_, e) => {
+    state.scrolls.push(e)
+    return {}
+  })
   // The engine's own hint line, which tells the mod how the screen is laid out; a tail ends it.
   on('ui.render', { component: 'PromptHint' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
@@ -375,6 +393,7 @@ const natural = (node: unknown): number => {
   if (type === 'Text') return Math.max(...textOf(node).split('\n').map(cellWidth))
   if (type === 'Button') return cellWidth(buttonText(node as Drawn))
   if (type === 'Code') return gutterOf(props) + Math.max(...String(props.source).split('\n').map(cellWidth))
+  if (typeof props.width === 'number') return props.width
   const pad = space(props.paddingLeft ?? props.paddingX ?? props.padding) + space(props.paddingRight ?? props.paddingX ?? props.padding)
   const sizes = children.map(natural)
   if (props.flexDirection === 'column') return Math.max(0, ...sizes) + pad
@@ -442,8 +461,13 @@ const paint = (node: unknown, width: number): string[] => {
   const top = space(props.marginTop ?? props.marginY ?? props.margin, true)
   const bottom = space(props.marginBottom ?? props.marginY ?? props.margin, true)
   const inner = width - left - right
-  const lines =
+  const laid =
     props.flexDirection === 'column' ? children.flatMap(kid => paint(kid, inner)) : paintRow(children, inner, props)
+  // A fixed height cuts what is past it and fills what is short of it.
+  const lines =
+    typeof props.height === 'number'
+      ? Array.from({ length: props.height }, (_, row) => laid[row] ?? '')
+      : laid
 
   return [...Array<string>(top).fill(''), ...lines.map(line => ' '.repeat(left) + line), ...Array<string>(bottom).fill('')]
 }
@@ -516,17 +540,27 @@ describe('helpers', () => {
       statusLine: false,
       diffStyle: 'quiet',
       paneBackground: 'transparent',
+      diffView: 'side',
     })
     expect(
-      readConfig({ autoOpen: 'never', pollSeconds: 0, statusLine: true, diffStyle: 'engine', paneBackground: 'theme' }),
+      readConfig({
+        autoOpen: 'never',
+        pollSeconds: 0,
+        statusLine: true,
+        diffStyle: 'engine',
+        paneBackground: 'theme',
+        diffView: 'inline',
+      }),
     ).toEqual({
       autoOpen: 'never',
       pollSeconds: 0,
       statusLine: true,
       diffStyle: 'engine',
       paneBackground: 'theme',
+      diffView: 'inline',
     })
     expect(readConfig({ paneBackground: 'plaid' }).paneBackground).toBe('transparent')
+    expect(readConfig({ diffView: 'beside' }).diffView).toBe('side')
     expect(readConfig({ diffStyle: 'loud' }).diffStyle).toBe('quiet')
     expect(readConfig({ autoOpen: 'sometimes', pollSeconds: -3 }).autoOpen).toBe('worktree')
     expect(readConfig({ pollSeconds: -3 }).pollSeconds).toBe(0)
@@ -3033,5 +3067,681 @@ describe('auto-open', () => {
     // Already in the worktree: the cwd does not move.
     await enter()
     expect(state.opened).toBe(0)
+  })
+})
+
+// ------------------------------------------------------------------ side
+
+/** Three hunks of a.txt, eight rows each as the diff region counts them. */
+const hunkAt = (line: number) => `@@ -${line},6 +${line},6 @@ fn${line}()\n c1\n c2\n-old${line}\n+new${line}\n c3\n c4\n c5\n`
+const LONG_A = `diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n${hunkAt(1)}${hunkAt(40)}${hunkAt(80)}`
+
+/** The tree fixture, each untracked text file's diff readable. */
+const sideTable = (overrides: Record<string, Answer> = {}) =>
+  treeTable({
+    'diff --no-index -- /dev/null deep/a/b/c.md': { exitCode: 1, stdout: 'diff --git a/deep/a/b/c.md b/deep/a/b/c.md\n@@ -0,0 +1,2 @@\n+1\n+2\n' },
+    'diff --no-index -- /dev/null deep/a/b/d.md': { exitCode: 1, stdout: 'diff --git a/deep/a/b/d.md b/deep/a/b/d.md\n@@ -0,0 +1 @@\n+1\n' },
+    'diff --no-index -- /dev/null src/lib/x.ts': {
+      exitCode: 1,
+      stdout: 'diff --git a/src/lib/x.ts b/src/lib/x.ts\n@@ -0,0 +1,4 @@\n+1\n+2\n+3\n+4\n',
+    },
+    ...overrides,
+  })
+
+/** The pane at `columns` and `bodyRows`, holding the keyboard unless told otherwise. */
+const sidePane = (columns: number, bodyRows = 24, isFocused = true) =>
+  ({ ...PANE, props: { ...PANE.props, bodyColumns: columns, isFocused, scroll: { offset: 0, bodyRows } } }) as const
+
+type SideUi = Finder & Parameters<typeof rowKeys>[0] & Parameters<typeof screen>[0]
+
+/** The row the cursor marks with `›`; at most one does. */
+const cursorOf = async (ui: SideUi): Promise<string | undefined> => {
+  const marked: string[] = []
+  for (const key of await rowKeys(ui)) if ((await rowLine(ui, key, 200)).startsWith('›')) marked.push(key)
+  expect(marked.length).toBeLessThanOrEqual(1)
+  return marked[0]
+}
+
+/** The region whose head is accented. */
+const regionOf = async (ui: Finder): Promise<string> => {
+  const tree = await ui.find({ type: 'Text', text: ' tree ' } as never)
+  const diff = await ui.find({ type: 'Text', text: ' diff ' } as never)
+  expect([tree?.props.color, diff?.props.color].filter(color => color === 'suggestion')).toHaveLength(1)
+  for (const head of [tree, diff]) if (head?.props.color !== 'suggestion') expect(head?.props.dimColor).toBe(true)
+  return tree?.props.color === 'suggestion' ? 'tree' : 'diff'
+}
+
+/** A region's rows as printed in `cells`, the blank cell beside the rule left out, or undefined when it is not drawn. */
+const regionLines = async (ui: Finder, region: 'tree' | 'diff', cells: number): Promise<string[] | undefined> => {
+  const box = await ui.find({ key: `side:${region}` })
+  if (box === undefined) return undefined
+  return paint({ ...box, props: { ...box.props, paddingLeft: 0, paddingRight: 0 } }, cells).map(line => line.trimEnd())
+}
+
+/** The cells each region of the split takes at `columns`, as the layout gives them. */
+const treeCells = (columns: number) => Math.min(48, Math.max(28, Math.round(columns * 0.38)))
+
+/** The person's wheel over the pane's body at `column`, by default on a row of the regions. */
+const wheelAt = ($: Engine, column: number, by: number, row = 12, bodyRows = 24) =>
+  $.ui.scroll({
+    component: 'Pane',
+    requestId: 'worktree-diff',
+    offset: 0,
+    by,
+    bodyRows,
+    contentRows: bodyRows,
+    origin: { kind: 'person' },
+    pointer: { column, row },
+  } as never)
+
+describe('side view', () => {
+  sideTest('the tree and the diff fill the body exactly, side by side from 80 columns, on terminal and desktop', async ($, on) => {
+    world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      for (const columns of [70, 90, 120]) {
+        for (const bodyRows of [12, 24, 40]) {
+          for (const isFocused of [true, false]) {
+            const ui = await $.ui.mount({ ...sidePane(columns, bodyRows, isFocused), surface })
+            const lines = await screen(ui, columns)
+            expect(lines).toHaveLength(bodyRows)
+            for (const line of lines) {
+              if (cellWidth(line) > columns) throw new Error(`${surface} at ${columns}: ${JSON.stringify(line)}`)
+            }
+            // The tree's head starts the regions, under the summary; the split draws the rule beside it.
+            const head = lines.findIndex(line => line.startsWith(' tree '))
+            expect(lines[head - 1]).toMatch(/^10 files {2}● 7 uncommitted/)
+            const ruled = lines.slice(head).filter(line => [...line][treeCells(columns)] === '│')
+            expect(ruled).toHaveLength(columns >= 80 ? bodyRows - head - (surface === 'terminal' || isFocused ? 1 : 0) : 0)
+            if (columns < 80) expect(lines[head]?.trimEnd()).toBe(' tree  diff')
+            else expect(lines[head]).toMatch(/^ tree +│ diff {2}deep\/a\/b\/ · 2 files +\+3$/)
+            expect(await regionOf(ui)).toBe('tree')
+            // The cursor starts on the first row, marked and semibold.
+            expect(await cursorOf(ui)).toBe('dir:deep/a/b')
+            expect(JSON.stringify((await ui.find({ key: 'dir:deep/a/b' }))?.children)).toContain('"weight":"semibold"')
+            expect(await regionLines(ui, 'diff', 40)).toEqual(columns < 80 ? undefined : ['? c.md' + ' '.repeat(32) + '+2', '? d.md' + ' '.repeat(32) + '+1'])
+            // Nothing to collapse: x is the inline view's.
+            expect(await ui.find({ key: 'collapse' })).toBeUndefined()
+            await ui.unmount()
+          }
+        }
+      }
+    }
+  })
+
+  sideTest('the pane asks for 120 columns, the inline view for none', async ($, on) => {
+    const { state } = world(on, { isOpen: false })
+    expect((await wtDiff($)).text).toBe(FOCUSED_SIDE)
+    expect(state.openArgs.at(-1)).toMatchObject({ id: 'worktree-diff', columns: 120, focus: true })
+  })
+
+  test('the inline view opens at the width it is given', async ($, on) => {
+    const { state } = world(on, { isOpen: false })
+    expect((await wtDiff($)).text).toBe(FOCUSED)
+    expect(state.openArgs.at(-1)).not.toHaveProperty('columns')
+  })
+
+  sideTest('the diff region reads the file under the cursor once it stands still, and shows a kept one while it reads it again', async ($, on) => {
+    const { state, clock } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      // Each surface starts with nothing read: a switch of mode drops what was.
+      await wtDiff($, 'mode committed')
+      await wtDiff($, 'mode all')
+      const ui = await $.ui.mount({ ...sidePane(120), surface })
+      await keys(ui, 'g')
+      const reads = () => state.calls.filter(call => call.startsWith('diff --no-index')).length
+      const before = reads()
+      // Passing over c.md to d.md reads d.md alone, once the cursor stands.
+      await keys(ui, 'jj')
+      expect(await cursorOf(ui)).toBe('file:deep/a/b/d.md')
+      expect(await regionLines(ui, 'diff', 73)).toEqual(['loading…'])
+      await clock.advance(119)
+      expect(reads()).toBe(before)
+      await clock.advance(1)
+      expect(state.calls.slice(-1)).toEqual(['diff --no-index -- /dev/null deep/a/b/d.md'])
+      const code = await ui.find({ type: 'Code' })
+      expect(code?.props).toMatchObject({ format: 'source', source: '1', startLine: 1, path: 'deep/a/b/d.md' })
+      expect((await screen(ui, 120)).find(line => line.includes('│ diff '))).toMatch(/│ diff {2}\? deep\/a\/b\/d\.md +\+1$/)
+      // Back on c.md: read now; on d.md again: kept and shown at once, then read again.
+      await keys(ui, 'k')
+      await clock.advance(120)
+      expect((await ui.find({ type: 'Code' }))?.props.source).toBe('1\n2')
+      const read = reads()
+      expect(read - before).toBe(2)
+      await keys(ui, 'j')
+      expect((await ui.find({ type: 'Code' }))?.props.source).toBe('1')
+      await clock.advance(120)
+      expect((await ui.find({ type: 'Code' }))?.props.source).toBe('1')
+      expect(reads()).toBe(read + 1)
+      // A modified file is drawn quiet, its path and counts in the head.
+      await ui.press({ key: 'file:a.txt' })
+      await clock.advance(120)
+      expect(await regionLines(ui, 'diff', 73)).toEqual(['@@ 1', '  line1', '- line2', '+ LINE2', '  line3', '+ line4', '+ extra'])
+      // A deleted file needs no read: its line says so.
+      await ui.press({ key: 'file:gone.txt' })
+      expect(await regionLines(ui, 'diff', 73)).toEqual(['deleted · 2 lines'])
+      await ui.unmount()
+    }
+  })
+
+  sideTest('in the tree j/k/d/b/g/e move the cursor and the window follows it', async ($, on) => {
+    world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      // 5 rows of the tree show at once: 14 - 7 above - the heads - the hint.
+      const ui = await $.ui.mount({ ...sidePane(120, 14), surface })
+      const shown = async () => (await regionLines(ui, 'tree', 46))?.length
+      await keys(ui, 'g')
+      expect(await shown()).toBe(surface === 'terminal' ? 5 : 6)
+      const walked: (string | undefined)[] = []
+      for (let step = 0; step < TREE_KEYS.length; step++) {
+        walked.push(await cursorOf(ui))
+        await keys(ui, 'j')
+      }
+      expect(walked).toEqual(TREE_KEYS)
+      // Past the end it stays; the window shows the last rows.
+      expect(await cursorOf(ui)).toBe('file:untracked.md')
+      expect((await regionLines(ui, 'tree', 46))?.at(-1)).toMatch(/^› \? ● untracked\.md +\+3$/)
+      await keys(ui, 'k')
+      expect(await cursorOf(ui)).toBe('file:keep.txt')
+      await keys(ui, 'g')
+      expect(await cursorOf(ui)).toBe('dir:deep/a/b')
+      expect((await regionLines(ui, 'tree', 46))?.[0]).toMatch(/^› ▾ deep\/a\/b\//)
+      // Half a window down and back.
+      await keys(ui, 'd')
+      expect(await cursorOf(ui)).toBe(TREE_KEYS[surface === 'terminal' ? 2 : 3])
+      await keys(ui, 'b')
+      expect(await cursorOf(ui)).toBe('dir:deep/a/b')
+      await keys(ui, 'e')
+      expect(await cursorOf(ui)).toBe('file:untracked.md')
+      // n and p have no Button in the tree.
+      expect(await ui.find({ key: 'nav:n' })).toBeUndefined()
+      await keys(ui, 'g')
+      await ui.unmount()
+    }
+  })
+
+  sideTest('l and w go to the diff, h and w come back; on a directory h and l fold, open and move as v0.3', async ($, on) => {
+    world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...sidePane(120), surface })
+      await keys(ui, 'g')
+      // On an open directory l goes in, h on a file goes up, h on an open directory folds it, l opens it.
+      await keys(ui, 'l')
+      expect(await cursorOf(ui)).toBe('file:deep/a/b/c.md')
+      await keys(ui, 'h')
+      expect(await cursorOf(ui)).toBe('dir:deep/a/b')
+      await keys(ui, 'h')
+      expect(await rowKeys(ui)).not.toContain('file:deep/a/b/c.md')
+      expect(await regionOf(ui)).toBe('tree')
+      await keys(ui, 'l')
+      expect(await rowKeys(ui)).toContain('file:deep/a/b/c.md')
+      // l on a file, or w, and the keys act on the diff; h or w come back.
+      await keys(ui, 'jl')
+      expect(await regionOf(ui)).toBe('diff')
+      await keys(ui, 'h')
+      expect(await regionOf(ui)).toBe('tree')
+      await keys(ui, 'w')
+      expect(await regionOf(ui)).toBe('diff')
+      // In the diff j/k scroll it: the cursor stays where it is.
+      await keys(ui, 'jk')
+      expect(await cursorOf(ui)).toBe('file:deep/a/b/c.md')
+      await keys(ui, 'w')
+      expect(await regionOf(ui)).toBe('tree')
+      await ui.unmount()
+    }
+  })
+
+  sideTest('in the diff j/k/d/b/n/p/g/e scroll it and never past either end', async ($, on) => {
+    const { clock } = world(on, { table: sideTable({ [`diff -M ${MB} -- :(literal)a.txt`]: ok(LONG_A) }), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      // 24 rows: 15 of the diff show, of its 24.
+      const ui = await $.ui.mount({ ...sidePane(120), surface })
+      await ui.press({ key: 'file:keep.txt' })
+      await ui.press({ key: 'file:a.txt' })
+      await clock.advance(120)
+      await keys(ui, 'w')
+      const rows = surface === 'terminal' ? 15 : 16
+      const first = async () => (await regionLines(ui, 'diff', 73))?.[0]
+      expect(await first()).toBe('@@ 1  fn1()')
+      expect((await regionLines(ui, 'diff', 73))?.length).toBe(rows)
+      await keys(ui, 'j')
+      expect(await first()).toBe('  c1')
+      await keys(ui, 'k')
+      expect(await first()).toBe('@@ 1  fn1()')
+      await keys(ui, 'k')
+      expect(await first()).toBe('@@ 1  fn1()')
+      await keys(ui, 'n')
+      expect(await first()).toBe('@@ 40  fn40()')
+      // The last hunk is past the last full window: n stops there.
+      await keys(ui, 'n')
+      expect(await first()).toBe(surface === 'terminal' ? '  c1' : '@@ 40  fn40()')
+      expect((await regionLines(ui, 'diff', 73))?.at(-1)).toBe('  c5')
+      // From inside hunk 40 p goes to its start; from its start, to hunk 1.
+      await keys(ui, 'p')
+      expect(await first()).toBe(surface === 'terminal' ? '@@ 40  fn40()' : '@@ 1  fn1()')
+      await keys(ui, 'p')
+      expect(await first()).toBe('@@ 1  fn1()')
+      // Half of 15 rows is 7, of 16 is 8.
+      await keys(ui, 'd')
+      expect(await first()).toBe(surface === 'terminal' ? '  c5' : '@@ 40  fn40()')
+      await keys(ui, 'b')
+      expect(await first()).toBe('@@ 1  fn1()')
+      await keys(ui, 'e')
+      expect((await regionLines(ui, 'diff', 73))?.at(-1)).toBe('  c5')
+      await keys(ui, 'g')
+      expect(await first()).toBe('@@ 1  fn1()')
+      // Another file starts at its top.
+      await keys(ui, 'e')
+      await keys(ui, 'h')
+      await keys(ui, 'j')
+      await keys(ui, 'k')
+      expect(await first()).toBe('@@ 1  fn1()')
+      await ui.unmount()
+    }
+  })
+
+  sideTest('diffStyle engine draws the window as hunks of its own; a file added whole as source from its first line shown', { options: { diffStyle: 'engine' } }, async ($, on) => {
+    const { clock } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    // 3 rows of each region show.
+    const ui = await $.ui.mount({ ...sidePane(120, 12), surface: 'terminal' })
+    await keys(ui, 'ekkkk')
+    expect(await cursorOf(ui)).toBe('file:a.txt')
+    await clock.advance(120)
+    // The header counts the lines the window keeps.
+    expect((await ui.find({ type: 'Code' }))?.props).toMatchObject({ format: 'diff', path: 'a.txt', source: '@@ -1,2 +1,1 @@\n line1\n-line2' })
+    await keys(ui, 'wjj')
+    expect((await ui.find({ type: 'Code' }))?.props.source).toBe('@@ -2,2 +2,2 @@\n-line2\n+LINE2\n line3')
+    await keys(ui, 'hkk')
+    expect(await cursorOf(ui)).toBe('file:src/lib/x.ts')
+    await clock.advance(120)
+    await keys(ui, 'we')
+    expect((await ui.find({ type: 'Code' }))?.props).toMatchObject({ format: 'source', source: '2\n3\n4', startLine: 2 })
+    await ui.unmount()
+  })
+
+  sideTest('below 80 columns one region shows at a time: l or w for the diff, h or w back', async ($, on) => {
+    const { clock } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...sidePane(70), surface })
+      await ui.press({ key: 'file:keep.txt' })
+      await ui.press({ key: 'file:a.txt' })
+      await clock.advance(120)
+      expect(await regionLines(ui, 'diff', 70)).toBeUndefined()
+      expect(await regionLines(ui, 'tree', 70)).toBeDefined()
+      await keys(ui, 'l')
+      expect(await regionLines(ui, 'tree', 70)).toBeUndefined()
+      expect((await regionLines(ui, 'diff', 70))?.[0]).toBe('@@ 1')
+      const lines = await screen(ui, 70)
+      expect(lines.find(line => line.startsWith(' tree '))).toMatch(/^ tree {2}diff {2}M a\.txt +\+3 −1$/)
+      expect(await regionOf(ui)).toBe('diff')
+      await keys(ui, 'h')
+      expect(await regionLines(ui, 'diff', 70)).toBeUndefined()
+      await keys(ui, 'w')
+      expect(await regionLines(ui, 'diff', 70)).toBeDefined()
+      await keys(ui, 'w')
+      expect(await regionOf(ui)).toBe('tree')
+      await ui.unmount()
+    }
+  })
+
+  sideTest('the hint row says the keys of the region they act on, each a Button of its own', async ($, on) => {
+    world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...sidePane(120), surface })
+      let columns = 120
+      const last = async () => (await screen(ui, columns)).at(-1)?.trimEnd()
+      if (surface === 'terminal') expect(await last()).toBe('j: down  k: up  l: open  w: diff  h: fold  q: close  d: page  b: back  g: top  e: end')
+      await keys(ui, 'w')
+      if (surface === 'terminal') {
+        expect(await last()).toBe('j: down  k: up  d: page  b: back  n: next  p: prev  h: tree  q: close  g: top  e: end  w: tree')
+      }
+      // One row: what does not fit is cut, still pressed by its letter.
+      await ui.redraw(sidePane(70).props)
+      columns = 70
+      if (surface === 'terminal') expect(await last()).toBe('j: down  k: up  d: page  b: back  n: next  p: prev  h: tree  q: close')
+      expect(await screen(ui, 70)).toHaveLength(24)
+      const hotkeys = (await ui.findAll({ type: 'Button' })).map(button => button.props.hotkey).filter(Boolean)
+      expect(new Set(hotkeys).size).toBe(hotkeys.length)
+      expect(hotkeys).not.toContain('x')
+      for (const button of (await ui.findAll({ type: 'Button' })).filter(one => one.key?.startsWith('nav:'))) {
+        expect(button.props).toMatchObject({ plain: true, dimColor: true })
+      }
+      await keys(ui, 'w')
+      // Without the keyboard: how to give it, on the terminal alone.
+      await ui.redraw(sidePane(120, 24, false).props)
+      columns = 120
+      expect(await ui.find({ key: 'nav:j' })).toBeUndefined()
+      expect(await screen(ui, 120)).toHaveLength(24)
+      if (surface === 'terminal') expect(await last()).toBe('ctrl+x tab to focus')
+      if (surface === 'terminal') expect((await ui.find({ type: 'Text', text: 'ctrl+x tab to focus' }))?.props.dimColor).toBe(true)
+      else expect(await ui.find({ type: 'Text', text: 'ctrl+x tab to focus' })).toBeUndefined()
+      await ui.unmount()
+    }
+  })
+
+  sideTest('a row pressed takes the cursor and the keys to the tree; pressed again, a file goes to the diff, a directory folds', async ($, on) => {
+    world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...sidePane(120), surface })
+      await ui.press({ key: 'file:keep.txt' })
+      expect(await cursorOf(ui)).toBe('file:keep.txt')
+      expect(await regionOf(ui)).toBe('tree')
+      await ui.press({ key: 'file:keep.txt' })
+      expect(await regionOf(ui)).toBe('diff')
+      await ui.press({ key: 'dir:src' })
+      expect(await cursorOf(ui)).toBe('dir:src')
+      expect(await regionOf(ui)).toBe('tree')
+      expect(await rowKeys(ui)).toContain('dir:src/lib')
+      await ui.press({ key: 'dir:src' })
+      expect(await rowKeys(ui)).not.toContain('dir:src/lib')
+      await ui.press({ key: 'dir:src' })
+      expect(await rowKeys(ui)).toContain('dir:src/lib')
+      // The ring starts on the cursor's row when the pane takes the keyboard.
+      expect(await autoFocused(ui)).toBe('dir:src')
+      await ui.unmount()
+    }
+  })
+
+  sideTest('the wheel moves the window under the pointer and not the body; the scroll keys go to the engine', async ($, on) => {
+    const { state, clock } = world(on, { table: sideTable({ [`diff -M ${MB} -- :(literal)a.txt`]: ok(LONG_A) }), files: treeFiles })
+    await wtDiff($, 'refresh')
+    // 5 rows of each region show.
+    const ui = await $.ui.mount({ ...sidePane(120, 14), surface: 'terminal' })
+    // Over the tree: its window moves, the cursor stays where it is.
+    await keys(ui, 'g')
+    const treeTop = async () => (await regionLines(ui, 'tree', 46))?.[0]
+    expect(await treeTop()).toMatch(/deep\/a\/b\//)
+    await wheelAt($, 3, 2)
+    expect(await treeTop()).toMatch(/d\.md/)
+    expect(await cursorOf(ui)).toBeUndefined()
+    await wheelAt($, 3, -5)
+    expect(await treeTop()).toMatch(/deep\/a\/b\//)
+    expect(await cursorOf(ui)).toBe('dir:deep/a/b')
+    // Over the rule and past it: the diff's, whichever region the keys are in.
+    await keys(ui, 'ekkkk')
+    await clock.advance(120)
+    expect((await regionLines(ui, 'diff', 73))?.[0]).toBe('@@ 1  fn1()')
+    await wheelAt($, treeCells(120), 1)
+    expect((await regionLines(ui, 'diff', 73))?.[0]).toBe('  c1')
+    await wheelAt($, 100, 50)
+    expect((await regionLines(ui, 'diff', 73))?.at(-1)).toBe('  c5')
+    expect(await regionOf(ui)).toBe('tree')
+    expect(state.scrolls).toEqual([])
+    // The scroll keys carry no pointer: the engine's to move.
+    await $.ui.scroll({
+      component: 'Pane',
+      requestId: 'worktree-diff',
+      offset: 1,
+      by: 1,
+      bodyRows: 24,
+      contentRows: 24,
+      origin: { kind: 'person' },
+    } as never)
+    expect(state.scrolls).toHaveLength(1)
+    await ui.unmount()
+  })
+
+  sideTest('a file gone after a refresh hands the cursor to the row below it; nothing listed is a notice as tall as the regions', async ($, on) => {
+    const { state } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...sidePane(90), surface: 'terminal' })
+    await ui.press({ key: 'file:gone.txt' })
+    expect(await cursorOf(ui)).toBe('file:gone.txt')
+    state.table = sideTable({
+      [`diff --numstat -z -M ${MB} --`]: ok(NUMSTAT_ALL.replace('0\t2\tgone.txt\0', '')),
+      [`diff --name-status -z -M ${MB} --`]: ok(NAMES_ALL.replace('D\0gone.txt\0', '')),
+      [`diff --name-only -z --no-renames ${MB} HEAD --`]: ok(NAMES_ONLY_COMMITTED.replace('gone.txt\0', '')),
+    })
+    await wtDiff($, 'refresh')
+    expect(await rowKeys(ui)).not.toContain('file:gone.txt')
+    expect(await cursorOf(ui)).toBe('file:keep.txt')
+
+    state.table = featTable({
+      [`diff --numstat -z -M ${MB} --`]: ok(''),
+      [`diff --name-status -z -M ${MB} --`]: ok(''),
+      [`diff --name-only -z --no-renames ${MB} HEAD --`]: ok(''),
+      'diff --name-only -z --no-renames HEAD --': ok(''),
+      'ls-files --others --exclude-standard -z': ok(''),
+    })
+    await wtDiff($, 'refresh')
+    const lines = await screen(ui, 90)
+    expect(lines).toHaveLength(24)
+    expect(lines.map(line => line.trimEnd())).toContain('✓ No changes vs main')
+    expect(await ui.find({ key: 'side:tree' })).toBeUndefined()
+    // The keys do nothing, and nothing throws.
+    await keys(ui, 'jklhwdbgenp')
+    await ui.unmount()
+  })
+
+  sideTest('z, t and a fold keep the cursor on a row that shows', async ($, on) => {
+    world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...sidePane(120), surface: 'terminal' })
+    await ui.press({ key: 'file:src/lib/x.ts' })
+    await ui.press({ key: 'fold' })
+    expect(await cursorOf(ui)).toBe('dir:src')
+    await ui.press({ key: 'fold' })
+    await ui.press({ key: 'file:src/lib/x.ts' })
+    await ui.press({ key: 'view' })
+    expect(await cursorOf(ui)).toBe('file:src/lib/x.ts')
+    await ui.press({ key: 'view' })
+    await ui.unmount()
+  })
+
+  sideTest('a wheel over the rows above the regions or the hint, or over a body too short to fit, is the engine’s', async ($, on) => {
+    const { state } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    // 7 rows above the regions, the regions on rows 7 to 12, the hint on 13.
+    const ui = await $.ui.mount({ ...sidePane(120, 14), surface: 'terminal' })
+    await keys(ui, 'g')
+    const treeTop = async () => (await regionLines(ui, 'tree', 46))?.[0]
+    await wheelAt($, 3, 1, 6, 14)
+    await wheelAt($, 3, 1, 13, 14)
+    expect(state.scrolls).toHaveLength(2)
+    expect(await treeTop()).toMatch(/deep\/a\/b\//)
+    // The heads' row is the regions'.
+    await wheelAt($, 3, 1, 7, 14)
+    expect(state.scrolls).toHaveLength(2)
+    expect(await treeTop()).toMatch(/c\.md/)
+    // Too short for all of it: the body overflows and the engine scrolls it.
+    await ui.redraw(sidePane(120, 8).props)
+    await wheelAt($, 3, 1, 7, 8)
+    expect(state.scrolls).toHaveLength(3)
+    expect(await treeTop()).toMatch(/c\.md/)
+    await ui.unmount()
+  })
+
+  sideTest('a refresh reads the cursor’s file again and drops the diffs read under an older snapshot', async ($, on) => {
+    const { state, clock } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...sidePane(120), surface: 'terminal' })
+    const reads = (name: string) => state.calls.filter(call => call === `diff --no-index -- /dev/null deep/a/b/${name}`).length
+    await ui.press({ key: 'file:deep/a/b/c.md' })
+    await clock.advance(120)
+    await keys(ui, 'j')
+    await clock.advance(120)
+    expect([reads('c.md'), reads('d.md')]).toEqual([1, 1])
+    // The same snapshot: the cursor's file is read again, the one it left kept, shown at once and read again.
+    await wtDiff($, 'refresh')
+    expect([reads('c.md'), reads('d.md')]).toEqual([1, 2])
+    await keys(ui, 'k')
+    expect((await ui.find({ type: 'Code' }))?.props.source).toBe('1\n2')
+    await clock.advance(120)
+    expect(reads('c.md')).toBe(2)
+    expect((await ui.find({ type: 'Code' }))?.props.source).toBe('1\n2')
+    // A newer one: the cursor's file is read again; d.md, read under the old one, is dropped and read on the way back.
+    state.table = sideTable({ [`diff --numstat -z -M ${MB} --`]: ok(NUMSTAT_ALL.replace('1\t0\tkeep.txt', '2\t0\tkeep.txt')) })
+    await wtDiff($, 'refresh')
+    expect([reads('c.md'), reads('d.md')]).toEqual([3, 2])
+    await keys(ui, 'j')
+    expect(await regionLines(ui, 'diff', 73)).toEqual(['loading…'])
+    await clock.advance(120)
+    expect(reads('d.md')).toBe(3)
+    expect((await ui.find({ type: 'Code' }))?.props.source).toBe('1')
+    await ui.unmount()
+  })
+
+  sideTest('a kept diff whose file changed but kept its line counts is read again, not shown stale', async ($, on) => {
+    const { state, clock } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...sidePane(120), surface: 'terminal' })
+    await ui.press({ key: 'file:deep/a/b/d.md' })
+    await clock.advance(120)
+    expect((await ui.find({ type: 'Code' }))?.props.source).toBe('1')
+    await keys(ui, 'k')
+    await clock.advance(120)
+    // d.md's one line is another now: the same counts, the same snapshot, and a refresh reads only c.md.
+    state.table = sideTable({
+      'diff --no-index -- /dev/null deep/a/b/d.md': { exitCode: 1, stdout: 'diff --git a/deep/a/b/d.md b/deep/a/b/d.md\n@@ -0,0 +1 @@\n+one\n' },
+    })
+    await wtDiff($, 'refresh')
+    await keys(ui, 'j')
+    await clock.advance(120)
+    expect((await ui.find({ type: 'Code' }))?.props.source).toBe('one')
+    await ui.unmount()
+  })
+
+  sideTest('a refresh leaves the tree where the wheel took it; a cursor in view keeps its place on screen', async ($, on) => {
+    const { state, clock } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    // 5 rows of the tree show.
+    const ui = await $.ui.mount({ ...sidePane(120, 14), surface: 'terminal' })
+    const treeTop = async () => (await regionLines(ui, 'tree', 46))?.[0]
+    await keys(ui, 'g')
+    await wheelAt($, 3, 2)
+    expect(await treeTop()).toMatch(/d\.md/)
+    // A poll with nothing changed, a refresh asked for, and one that changed what is listed.
+    await clock.advance(5_000)
+    expect(await treeTop()).toMatch(/d\.md/)
+    await wtDiff($, 'refresh')
+    expect(await treeTop()).toMatch(/d\.md/)
+    state.table = sideTable({ [`diff --numstat -z -M ${MB} --`]: ok(NUMSTAT_ALL.replace('1\t0\tkeep.txt', '2\t0\tkeep.txt')) })
+    await wtDiff($, 'refresh')
+    expect(await treeTop()).toMatch(/d\.md/)
+    expect(await cursorOf(ui)).toBeUndefined()
+    // The next key brings the cursor back into view.
+    await keys(ui, 'j')
+    expect(await cursorOf(ui)).toBe('file:deep/a/b/c.md')
+    expect(await treeTop()).toMatch(/c\.md/)
+    // A row gone above a cursor in view: the cursor stays on its screen row.
+    await keys(ui, 'jjj')
+    expect(await cursorOf(ui)).toBe('file:dir/ubin.bin')
+    const shown = (await regionLines(ui, 'tree', 46)) ?? []
+    const row = shown.findIndex(line => line.startsWith('›'))
+    state.table = sideTable({ 'ls-files --others --exclude-standard -z': ok(`${UNTRACKED}deep/a/b/d.md\0src/lib/x.ts\0`) })
+    await wtDiff($, 'refresh')
+    expect(await rowKeys(ui)).not.toContain('file:deep/a/b/c.md')
+    expect(await cursorOf(ui)).toBe('file:dir/ubin.bin')
+    expect(((await regionLines(ui, 'tree', 46)) ?? []).findIndex(line => line.startsWith('›'))).toBe(row)
+    await ui.unmount()
+  })
+
+  sideTest('another mode starts the diff of the same file at its top', async ($, on) => {
+    const { clock } = world(on, {
+      table: sideTable({ [`diff -M ${MB} -- :(literal)a.txt`]: ok(LONG_A), [`diff -M ${MB} HEAD -- :(literal)a.txt`]: ok(LONG_A) }),
+      files: treeFiles,
+    })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...sidePane(120), surface: 'terminal' })
+    await ui.press({ key: 'file:keep.txt' })
+    await ui.press({ key: 'file:a.txt' })
+    await clock.advance(120)
+    await keys(ui, 'wn')
+    const first = async () => (await regionLines(ui, 'diff', 73))?.[0]
+    expect(await first()).toBe('@@ 40  fn40()')
+    await wtDiff($, 'mode committed')
+    await clock.advance(120)
+    expect(await cursorOf(ui)).toBe('file:a.txt')
+    expect(await first()).toBe('@@ 1  fn1()')
+    // A refresh in the same mode keeps where it is.
+    await keys(ui, 'n')
+    await wtDiff($, 'refresh')
+    expect(await first()).toBe('@@ 40  fn40()')
+    await ui.unmount()
+  })
+
+  sideTest('side by side, a blank cell sits on each side of the rule', async ($, on) => {
+    const { clock } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    for (const columns of [90, 120]) {
+      const ui = await $.ui.mount({ ...sidePane(columns), surface: 'terminal' })
+      await ui.press({ key: 'file:keep.txt' })
+      await ui.press({ key: 'file:a.txt' })
+      await clock.advance(120)
+      const lines = await screen(ui, columns)
+      const head = lines.findIndex(line => line.startsWith(' tree '))
+      const cells = treeCells(columns)
+      const ruled = lines.slice(head + 1).filter(line => [...line][cells] === '│')
+      expect(ruled.length).toBeGreaterThan(5)
+      for (const line of ruled) {
+        expect([...line][cells - 1]).toBe(' ')
+        if ([...line].length > cells + 1) expect([...line][cells + 1]).toBe(' ')
+      }
+      // The counts of the tree's rows and the diff's marks both a cell away.
+      expect(ruled.some(line => /\+3 −1 │ - line2/.test(line) || /\+\d+ │ /.test(line))).toBe(true)
+      expect(ruled.some(line => line.includes('│ + LINE2'))).toBe(true)
+      await ui.unmount()
+    }
+  })
+
+  test('keepRecent keeps the last 16 files read, the one just read among them', async () => {
+    const diff = (signature: string) => ({ hunks: '', isBinary: false, omittedLines: 0, signature })
+    const many: Record<string, ReturnType<typeof diff>> = {}
+    for (let index = 0; index < 17; index++) many[`f${index}`] = diff(`s${index}`)
+    const kept = keepRecent(many, 'f16')
+    expect(Object.keys(kept)).toEqual(Array.from({ length: 16 }, (_, index) => `f${index + 1}`))
+    // The one just read stays even when it was among the first in.
+    expect(Object.keys(keepRecent(many, 'f0'))).toEqual([...Array.from({ length: 15 }, (_, index) => `f${index + 2}`), 'f0'])
+    expect(keepRecent({ a: diff('1') }, 'b')).toEqual({ a: diff('1') })
+  })
+
+  sideTest('the ring sits on the cursor’s row, or on h’s Button while the diff alone shows', async ($, on) => {
+    world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    const single = { kind: 'single', columns: 70, width: 70 } as const
+    const split = { kind: 'split', columns: 120, tree: 46, separator: 1, diff: 73 } as const
+    expect(sideRing(single, 'diff', 'file:a.txt')).toBe('nav:h')
+    expect(sideRing(single, 'tree', 'file:a.txt')).toBe('file:a.txt')
+    expect(sideRing(split, 'diff', 'file:a.txt')).toBe('file:a.txt')
+    expect(sideRing(undefined, 'diff', null)).toBeUndefined()
+    for (const columns of [70, 120]) {
+      const ui = await $.ui.mount({ ...sidePane(columns), surface: 'terminal' })
+      await ui.press({ key: 'file:keep.txt' })
+      await ui.press({ key: 'file:a.txt' })
+      expect(await autoFocused(ui)).toBe('file:a.txt')
+      await keys(ui, 'l')
+      expect(await autoFocused(ui)).toBe(columns < 80 ? 'nav:h' : 'file:a.txt')
+      await keys(ui, 'h')
+      expect(await autoFocused(ui)).toBe('file:a.txt')
+      await ui.unmount()
+    }
+  })
+
+  test('keptCursor stays, gives way below then above, goes to what hides it, else to the first row', async () => {
+    const row = (key: string, depth = 0): NavRow => ({
+      key,
+      kind: key.startsWith('dir:') ? 'dir' : 'file',
+      path: key.slice(key.indexOf(':') + 1),
+      depth,
+    })
+    const all = [row('dir:src'), row('dir:src/lib', 1), row('file:src/lib/x.ts', 2), row('file:src/y.ts', 1), row('file:z.ts')]
+    expect(keptCursor(all, all, 'file:src/y.ts')).toBe('file:src/y.ts')
+    expect(keptCursor(all, all, null)).toBe('dir:src')
+    expect(keptCursor([], [], 'file:z.ts')).toBe('file:z.ts')
+    // Gone: the row below it, or above at the end.
+    expect(keptCursor(all, all.filter(one => one.key !== 'file:src/y.ts'), 'file:src/y.ts')).toBe('file:z.ts')
+    expect(keptCursor(all, all.slice(0, 4), 'file:z.ts')).toBe('file:src/y.ts')
+    // Hidden by a fold: the directory that hides it, the nearest.
+    expect(keptCursor([], all.slice(0, 2).concat(all.slice(3)), 'file:src/lib/x.ts')).toBe('dir:src/lib')
+    expect(keptCursor([], [all[0] as NavRow, all[4] as NavRow], 'file:src/lib/x.ts')).toBe('dir:src')
+    expect(keptCursor([], [all[4] as NavRow], 'file:src/lib/x.ts')).toBe('file:z.ts')
   })
 })
