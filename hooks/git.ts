@@ -175,6 +175,21 @@ export const parseReflogCreatedFrom = (out: string): string | null => {
   return match?.[1]?.trim() || null
 }
 
+/**
+ * The branch HEAD left when it first checked out `branch`: the oldest
+ * `checkout: moving from <X> to <branch>` line of HEAD's reflog. Null when
+ * there is none, or HEAD was detached then (X is a commit id).
+ */
+export const parseCheckoutFrom = (out: string, branch: string): string | null => {
+  let from: string | null = null
+  for (const line of out.split('\n')) {
+    const match = line.trim().match(/^checkout: moving from (\S+) to (\S+)$/)
+    if (match?.[2] === branch) from = match[1] ?? null
+  }
+
+  return from === null || /^[0-9a-f]{40,64}$/.test(from) ? null : from
+}
+
 export type WorktreeEntry = {
   path: string
   head: string | null
@@ -310,6 +325,10 @@ export type BaseContext = {
   root: string
   /** Current branch, null when detached. */
   branch: string | null
+  /** A linked worktree, as opposed to the repository's main checkout. */
+  isLinked: boolean
+  /** The repository's integration branch, as `/wt-diff trunk` set it; null when unset. */
+  trunk?: string | null
 }
 
 export type ResolvedBase = { ref: string; source: BaseSource }
@@ -347,47 +366,46 @@ export const isOwnCopy = (ref: string, branch: string): boolean => {
 }
 
 /**
- * The branch this worktree is compared against, by spec §2's order:
- * override, the branch's creation reflog, its upstream, the main worktree's
- * branch, the default branch. Null when none applies; rejects only for an
- * override that names no commit.
+ * Whether the trunk is the branch or a remote copy of it. `/wt-diff trunk`
+ * stores a branch by its full name, so `refs/heads/team/x` is a local branch,
+ * never a copy of `x`; only a short name falls back to guessing a remote.
  */
-export const resolveBase = async (
+export const isTrunkOwnCopy = (trunk: string, branch: string): boolean =>
+  trunk.startsWith('refs/heads/') ? shortRef(trunk) === branch : isOwnCopy(trunk, branch)
+
+/**
+ * The trunk as a name to compare against, null when it cannot be one: it
+ * reads as an option, moves with HEAD (`HEAD~2`, `@{u}`), or is the branch's
+ * own copy.
+ */
+const usableTrunk = (trunk: string | null | undefined, branch: string | null): string | null => {
+  if (!trunk) return null
+  const name = shortRef(trunk)
+  if (name.startsWith('-') || stableStartPoint(name) !== name) return null
+
+  return branch !== null && isTrunkOwnCopy(trunk, branch) ? null : name
+}
+
+const upstreamOf = async (deps: GitDeps, root: string, branch: string): Promise<string> => {
+  const up = await git(deps, root, ['rev-parse', '--abbrev-ref', `${branch}@{upstream}`])
+
+  return up.exitCode === 0 ? up.stdout.trim() : ''
+}
+
+/** Where HEAD came from when it first checked out the branch, as a stable name. */
+const checkedOutFrom = async (deps: GitDeps, root: string, branch: string): Promise<string | null> => {
+  const log = await git(deps, root, ['reflog', 'show', '--format=%gs', 'HEAD'])
+  const from = log.exitCode === 0 ? parseCheckoutFrom(log.stdout, branch) : null
+
+  return from === null ? null : stableStartPoint(from)
+}
+
+/** `origin/HEAD`, else the first of main, master, trunk, develop that exists and is not this branch. */
+const defaultBranch = async (
   deps: GitDeps,
-  ctx: BaseContext,
-  override?: string | null,
+  root: string,
+  branch: string | null,
 ): Promise<ResolvedBase | null> => {
-  const { root, branch } = ctx
-
-  if (override) {
-    if (!(await isCommit(deps, root, override))) {
-      throw new GitError(`Base override "${override}" is not a commit (clear it with /wt-diff base)`)
-    }
-    return { ref: override, source: 'override' }
-  }
-
-  if (branch !== null) {
-    const reflog = await git(deps, root, ['reflog', 'show', '--format=%gs', `refs/heads/${branch}`])
-    const created = reflog.exitCode === 0 ? parseReflogCreatedFrom(reflog.stdout) : null
-    // Stored as written: `HEAD~2` would be read against today's HEAD.
-    const from = created === null ? null : stableStartPoint(shortRef(created))
-    // A branch checked out from its remote copy (`git worktree add ../wt
-    // topic` DWIM) started at origin/topic, which is no base.
-    if (from !== null && !isOwnCopy(from, branch) && (await isCommit(deps, root, from))) {
-      return { ref: from, source: 'reflog' }
-    }
-
-    const up = await git(deps, root, ['rev-parse', '--abbrev-ref', `${branch}@{upstream}`])
-    const upstream = up.exitCode === 0 ? up.stdout.trim() : ''
-    if (upstream !== '' && !isOwnCopy(upstream, branch)) return { ref: upstream, source: 'upstream' }
-  }
-
-  const list = await git(deps, root, ['worktree', 'list', '--porcelain'])
-  const main = list.exitCode === 0 ? parseWorktreeListPorcelain(list.stdout)[0] : undefined
-  if (main?.branch && main.branch !== branch && (await isCommit(deps, root, main.branch))) {
-    return { ref: main.branch, source: 'main-worktree' }
-  }
-
   const originHead = await git(deps, root, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
   const remoteDefault = originHead.exitCode === 0 ? originHead.stdout.trim() : ''
   if (remoteDefault !== '' && (await isCommit(deps, root, remoteDefault))) {
@@ -402,12 +420,91 @@ export const resolveBase = async (
   return null
 }
 
+/**
+ * The branch this worktree is compared against. A linked worktree: override,
+ * the branch's creation reflog, its upstream, the trunk, the main worktree's
+ * branch, the default branch. The main checkout, which is often the trunk
+ * itself: override, reflog (`Created from HEAD` read back from HEAD's
+ * reflog), the trunk, its own upstream (what is not pushed yet), the default
+ * branch. On the trunk itself the main checkout skips the reflog; with a
+ * creation entry that names no base it skips its own upstream. Neither the
+ * reflog nor an upstream nor the trunk counts when it is the branch's own
+ * copy, except the main checkout's upstream. Null when none applies; rejects
+ * only for an override that names no commit.
+ */
+export const resolveBase = async (
+  deps: GitDeps,
+  ctx: BaseContext,
+  override?: string | null,
+): Promise<ResolvedBase | null> => {
+  const { root, branch, isLinked: isLinkedWorktree, trunk } = ctx
+
+  if (override) {
+    if (!(await isCommit(deps, root, override))) {
+      throw new GitError(`Base override "${override}" is not a commit (clear it with /wt-diff base)`)
+    }
+    return { ref: override, source: 'override' }
+  }
+
+  // On the trunk itself the reflog says only where the trunk began, which
+  // the user has just said is not the point: compare against what is not pushed.
+  const isOnTrunk = !isLinkedWorktree && branch !== null && !!trunk && isTrunkOwnCopy(trunk, branch)
+  // A creation entry that names no base (`Created from HEAD` with nothing
+  // to recover) keeps the main checkout off its own upstream, as in v0.1.
+  let isCreationUnusable = false
+
+  if (branch !== null && !isOnTrunk) {
+    const reflog = await git(deps, root, ['reflog', 'show', '--format=%gs', `refs/heads/${branch}`])
+    const created = reflog.exitCode === 0 ? parseReflogCreatedFrom(reflog.stdout) : null
+    // Stored as written: `HEAD~2` would be read against today's HEAD.
+    const named = created === null ? null : stableStartPoint(shortRef(created))
+    let from = named
+    // `git checkout -b x` with no start point: HEAD's reflog still says
+    // which branch it was on then.
+    if (created !== null && named === null && !isLinkedWorktree && /^(?:HEAD|@)(?:[~^]\d*)*$/.test(created)) {
+      from = await checkedOutFrom(deps, root, branch)
+    }
+    // A branch checked out from its remote copy (`git worktree add ../wt
+    // topic` DWIM) started at origin/topic, which is no base.
+    if (from !== null && !isOwnCopy(from, branch) && (await isCommit(deps, root, from))) {
+      return { ref: from, source: 'reflog' }
+    }
+    isCreationUnusable = created !== null && named === null
+  }
+
+  // The trunk compared against itself is no base: on it, fall to what follows.
+  const trunkRef = usableTrunk(trunk, branch)
+
+  if (!isLinkedWorktree) {
+    if (trunkRef !== null && (await isCommit(deps, root, trunkRef))) return { ref: trunkRef, source: 'trunk' }
+    const upstream = branch === null || isCreationUnusable ? '' : await upstreamOf(deps, root, branch)
+    if (upstream !== '') return { ref: upstream, source: 'upstream' }
+    return defaultBranch(deps, root, branch)
+  }
+
+  if (branch !== null) {
+    const upstream = await upstreamOf(deps, root, branch)
+    if (upstream !== '' && !isOwnCopy(upstream, branch)) return { ref: upstream, source: 'upstream' }
+  }
+  if (trunkRef !== null && (await isCommit(deps, root, trunkRef))) return { ref: trunkRef, source: 'trunk' }
+
+  const list = await git(deps, root, ['worktree', 'list', '--porcelain'])
+  const main = list.exitCode === 0 ? parseWorktreeListPorcelain(list.stdout)[0] : undefined
+  if (main?.branch && main.branch !== branch && (await isCommit(deps, root, main.branch))) {
+    return { ref: main.branch, source: 'main-worktree' }
+  }
+
+  return defaultBranch(deps, root, branch)
+}
+
 // --------------------------------------------------------------- snapshot
 
 export type SnapshotRequest = {
   cwd: string
   mode: DiffMode
   baseOverride?: string | null
+  /** The repository's trunk, stored under its git common dir. */
+  trunk?: string | null
   maxFiles?: number
 }
 
@@ -436,6 +533,7 @@ export const snapshotSignature = (snapshot: Unsigned): string =>
       snapshot.isRepo,
       snapshot.error ?? null,
       snapshot.root,
+      snapshot.gitCommonDir,
       snapshot.isLinkedWorktree,
       snapshot.branch,
       snapshot.head,
@@ -464,6 +562,7 @@ const emptySnapshot = (cwd: string, mode: DiffMode): Unsigned => ({
   cwd,
   isRepo: false,
   root: '',
+  gitCommonDir: '',
   isLinkedWorktree: false,
   branch: null,
   head: '',
@@ -646,6 +745,48 @@ export const isLinked = (stdout: string): boolean => {
   return lines.length === 2 && gitDir !== commonDir
 }
 
+/** `/a/./b/../c/` → `/a/c`. */
+const normalizePath = (path: string): string => {
+  const parts: string[] = []
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') parts.pop()
+    else parts.push(part)
+  }
+
+  return `/${parts.join('/')}`
+}
+
+/**
+ * The common dir out of the same output, absolute. Git before 2.31 may
+ * answer it relative to where it ran, the worktree `root`.
+ */
+export const commonDirOf = (stdout: string, root: string): string => {
+  const lines = stdout.split('\n').map(line => line.trim()).filter(line => line !== '')
+  const dir = (lines[0]?.startsWith('--') ? lines[2] : lines[1]) ?? ''
+  if (dir === '') return ''
+
+  return normalizePath(dir.startsWith('/') ? dir : joinPath(root, dir))
+}
+
+const DIRS_ARGS = ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'] as const
+
+export type RepoDirs = { root: string; gitCommonDir: string }
+
+/**
+ * The worktree root and the repository's common dir, as `computeSnapshot`
+ * finds them; null outside a repository, an empty common dir when only it
+ * failed.
+ */
+export const repoDirs = async (deps: GitDeps, cwd: string): Promise<RepoDirs | null> => {
+  const top = await git(deps, cwd, ['rev-parse', '--show-toplevel'])
+  const root = top.stdout.trim()
+  if (top.exitCode !== 0 || root === '') return null
+  const dirs = await git(deps, root, DIRS_ARGS)
+
+  return { root, gitCommonDir: dirs.exitCode === 0 ? commonDirOf(dirs.stdout, root) : '' }
+}
+
 /**
  * The worktree's changes in `mode` versus its base. Never rejects: a git
  * failure lands in `error`, beside whatever was learnt before it.
@@ -654,7 +795,7 @@ export const computeSnapshot = async (
   deps: GitDeps,
   request: SnapshotRequest,
 ): Promise<Snapshot> => {
-  const { cwd, mode, baseOverride, maxFiles = DEFAULT_MAX_FILES } = request
+  const { cwd, mode, baseOverride, trunk, maxFiles = DEFAULT_MAX_FILES } = request
   const snapshot = emptySnapshot(cwd, mode)
 
   try {
@@ -670,11 +811,12 @@ export const computeSnapshot = async (
     snapshot.root = root
 
     const [dirs, symbolic, head] = await Promise.all([
-      gitOk(deps, root, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir']),
+      gitOk(deps, root, DIRS_ARGS),
       git(deps, root, ['symbolic-ref', '--short', '-q', 'HEAD']),
       git(deps, root, ['rev-parse', '--verify', '--quiet', '--short', 'HEAD']),
     ])
     snapshot.isLinkedWorktree = isLinked(dirs.stdout)
+    snapshot.gitCommonDir = commonDirOf(dirs.stdout, root)
     const branch = symbolic.exitCode === 0 ? symbolic.stdout.trim() : ''
     snapshot.branch = branch === '' ? null : branch
     snapshot.head = head.exitCode === 0 ? head.stdout.trim() : ''
@@ -682,7 +824,11 @@ export const computeSnapshot = async (
     // A repo with no commits has nothing to diff against yet.
     if (snapshot.head === '') return await finish(deps, snapshot)
 
-    const resolved = await resolveBase(deps, { root, branch: snapshot.branch }, baseOverride)
+    const resolved = await resolveBase(
+      deps,
+      { root, branch: snapshot.branch, isLinked: snapshot.isLinkedWorktree, trunk },
+      baseOverride,
+    )
     if (resolved === null) {
       // Uncommitted changes need no base, so that mode still lists them.
       if (mode === 'uncommitted') Object.assign(snapshot, await listFiles(deps, root, mode, null, maxFiles))

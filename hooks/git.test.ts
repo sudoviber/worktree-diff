@@ -2,18 +2,22 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import type { FileChange, Snapshot } from '../types'
 import {
+  commonDirOf,
   computeSnapshot,
   countLines,
   git,
   GIT_PREFIX,
   hashString,
   isLinked,
+  isTrunkOwnCopy,
   loadFileDiff,
   parseNameStatusZ,
   parseNumstatZ,
   parsePathsZ,
+  parseCheckoutFrom,
   parseReflogCreatedFrom,
   parseWorktreeListPorcelain,
+  repoDirs,
   resolveBase,
   snapshotSignature,
   splitHunks,
@@ -226,6 +230,28 @@ describe('parsers', () => {
     expect(parsePathsZ('')).toEqual([])
   })
 
+  // HEAD's reflog (real git 2.54): `checkout -b feat/y`, a commit, `switch
+  // -c feat/z`, `checkout --detach`, `checkout -b feat/w`, back to main, then
+  // feat/y again.
+  const HEAD_REFLOG =
+    'checkout: moving from main to feat/y\n' +
+    'checkout: moving from feat/w to main\n' +
+    'checkout: moving from d56a0ac78a6595ec58136369930be7252d9ce3b9 to feat/w\n' +
+    'checkout: moving from feat/z to HEAD\n' +
+    'checkout: moving from feat/y to feat/z\n' +
+    'commit: y1\n' +
+    'checkout: moving from main to feat/y\n' +
+    'commit (initial): init\n'
+
+  test('HEAD reflog: the branch HEAD left when it first checked the branch out', async () => {
+    expect(parseCheckoutFrom(HEAD_REFLOG, 'feat/y')).toBe('main')
+    expect(parseCheckoutFrom(HEAD_REFLOG, 'feat/z')).toBe('feat/y')
+    // Made while detached: a commit id is no base name.
+    expect(parseCheckoutFrom(HEAD_REFLOG, 'feat/w')).toBeNull()
+    expect(parseCheckoutFrom(HEAD_REFLOG, 'feat/v')).toBeNull()
+    expect(parseCheckoutFrom('', 'feat/y')).toBeNull()
+  })
+
   test('reflog: the oldest line names the creation point', async () => {
     expect(parseReflogCreatedFrom('commit: feat1\nbranch: Created from main\n')).toBe('main')
     expect(parseReflogCreatedFrom('branch: Created from HEAD\n')).toBe('HEAD')
@@ -340,7 +366,7 @@ describe('truncateHunks', () => {
 // ------------------------------------------------------------------- base
 
 describe('resolveBase', () => {
-  const ctx = { root: ROOT, branch: 'feat' }
+  const ctx = { root: ROOT, branch: 'feat', isLinked: true }
 
   test('1. an override wins, once it names a commit', async () => {
     const { deps } = fakeDeps(featTable({ 'rev-parse --verify --quiet v1.0^{commit}': ok('abc\n') }))
@@ -452,56 +478,89 @@ describe('resolveBase', () => {
         'worktree list --porcelain': ok(PORCELAIN_ALL),
       }),
     )
-    expect(await resolveBase(deps, { root: '/w/t1-wt2', branch: 'fromhead' })).toEqual({
+    expect(await resolveBase(deps, { root: '/w/t1-wt2', branch: 'fromhead', isLinked: true })).toEqual({
       ref: 'main',
       source: 'main-worktree',
     })
   })
 
+  test('a linked worktree never reads HEAD\'s reflog for `Created from HEAD`', async () => {
+    const { deps, calls } = fakeDeps(
+      featTable({
+        'reflog show --format=%gs refs/heads/fromhead': ok('branch: Created from HEAD\n'),
+        'rev-parse --abbrev-ref fromhead@{upstream}': fail(
+          128,
+          "fatal: no upstream configured for branch 'fromhead'\n",
+        ),
+        'worktree list --porcelain': ok(PORCELAIN_ALL),
+      }),
+    )
+    expect(await resolveBase(deps, { root: '/w/t1-wt2', branch: 'fromhead', isLinked: true })).toEqual({
+      ref: 'main',
+      source: 'main-worktree',
+    })
+    expect(calls.some(c => c.key === 'reflog show --format=%gs HEAD')).toBe(false)
+  })
+
   test('4. a detached HEAD skips reflog and upstream', async () => {
     const { deps, calls } = fakeDeps(featTable({ 'worktree list --porcelain': ok(PORCELAIN_ALL) }))
-    expect(await resolveBase(deps, { root: '/w/t1-wt3', branch: null })).toEqual({
+    expect(await resolveBase(deps, { root: '/w/t1-wt3', branch: null, isLinked: true })).toEqual({
       ref: 'main',
       source: 'main-worktree',
     })
     expect(calls.some(c => c.key.startsWith('reflog') || c.key.includes('@{upstream}'))).toBe(false)
   })
 
-  // The main checkout itself, on main tracking origin/main.
+  test('6. a main worktree on no branch leaves the default branch', async () => {
+    const { deps } = fakeDeps(
+      featTable({
+        'reflog show --format=%gs refs/heads/feat': ok('branch: Created from HEAD\n'),
+        'worktree list --porcelain': ok(
+          `worktree ${REPO}\nHEAD ${MAIN_SHA}\ndetached\n\n` +
+            `worktree ${ROOT}\nHEAD e47b652208a1df9b8a3cbff954e65fc4b24fd4db\nbranch refs/heads/feat\n\n`,
+        ),
+        'symbolic-ref --short refs/remotes/origin/HEAD': ok('origin/main\n'),
+        'rev-parse --verify --quiet origin/main^{commit}': ok(`${MAIN_SHA}\n`),
+      }),
+    )
+    expect(await resolveBase(deps, ctx)).toEqual({ ref: 'origin/main', source: 'default-branch' })
+  })
+
+  // The main checkout itself, on main, no upstream (cloned before a push).
   const mainCheckout = (overrides: Record<string, Answer>) =>
     featTable({
       'reflog show --format=%gs refs/heads/main': ok('commit: main2\ncommit (initial): init\n'),
-      'rev-parse --abbrev-ref main@{upstream}': ok('origin/main\n'),
+      'rev-parse --abbrev-ref main@{upstream}': fail(128, "fatal: no upstream configured for branch 'main'\n"),
       ...overrides,
     })
 
-  test('5. the default branch: origin/HEAD', async () => {
+  test('main checkout 5. the default branch: origin/HEAD', async () => {
     const { deps } = fakeDeps(
       mainCheckout({
         'symbolic-ref --short refs/remotes/origin/HEAD': ok('origin/main\n'),
         'rev-parse --verify --quiet origin/main^{commit}': ok(`${MAIN_SHA}\n`),
       }),
     )
-    expect(await resolveBase(deps, { root: REPO, branch: 'main' })).toEqual({
+    expect(await resolveBase(deps, { root: REPO, branch: 'main', isLinked: false })).toEqual({
       ref: 'origin/main',
       source: 'default-branch',
     })
   })
 
-  test('5. no origin/HEAD: the first local default branch that is not this one', async () => {
+  test('main checkout 5. no origin/HEAD: the first local default branch that is not this one', async () => {
     const { deps } = fakeDeps(
       mainCheckout({
         'rev-parse --verify --quiet master^{commit}': NOT_A_COMMIT,
         'rev-parse --verify --quiet trunk^{commit}': ok('abc\n'),
       }),
     )
-    expect(await resolveBase(deps, { root: REPO, branch: 'main' })).toEqual({
+    expect(await resolveBase(deps, { root: REPO, branch: 'main', isLinked: false })).toEqual({
       ref: 'trunk',
       source: 'default-branch',
     })
   })
 
-  test('6. nothing applies: null', async () => {
+  test('main checkout 6. nothing applies: null', async () => {
     const { deps } = fakeDeps(
       mainCheckout({
         'rev-parse --verify --quiet master^{commit}': NOT_A_COMMIT,
@@ -509,7 +568,230 @@ describe('resolveBase', () => {
         'rev-parse --verify --quiet develop^{commit}': NOT_A_COMMIT,
       }),
     )
-    expect(await resolveBase(deps, { root: REPO, branch: 'main' })).toBeNull()
+    expect(await resolveBase(deps, { root: REPO, branch: 'main', isLinked: false })).toBeNull()
+  })
+})
+
+// Real git 2.54 output from a second throwaway repo: `main` is the default
+// branch (origin/HEAD), `feat/x` the integration branch. The main checkout
+// sits on feat/x with its reflog expired and two commits not pushed to its
+// upstream origin/feat/x. Linked worktrees: wt1 created from origin/feat/x
+// (tracking it); wt3 created `--no-track` from it, its reflog expired too.
+const V2 = '/w/v2-t1'
+const V2_FEAT = '14c77dd74d5b18e4062dca59e61bc3e898921d85'
+const V2_MAIN = 'b9abeb84fd3f8fc20d9d409bce4b06c13cddbef9'
+const V2_HEAD = '02ec883c85e8d635e633fb82b48370c3dc96bc84'
+
+const v2Table = (overrides: Record<string, Answer> = {}): Record<string, Answer> => ({
+  'reflog show --format=%gs refs/heads/feat/x': ok('commit: unpushed 2\n'),
+  'rev-parse --abbrev-ref feat/x@{upstream}': ok('origin/feat/x\n'),
+  'reflog show --format=%gs refs/heads/wt1': ok('branch: Created from origin/feat/x\n'),
+  'rev-parse --abbrev-ref wt1@{upstream}': ok('origin/feat/x\n'),
+  'reflog show --format=%gs refs/heads/wt3': ok(''),
+  'rev-parse --abbrev-ref wt3@{upstream}': fail(128, "fatal: no upstream configured for branch 'wt3'\n"),
+  'worktree list --porcelain': ok(
+    `worktree ${V2}/repo\nHEAD ${V2_HEAD}\nbranch refs/heads/feat/x\n\n` +
+      `worktree ${V2}/wt1\nHEAD ${V2_FEAT}\nbranch refs/heads/wt1\n\n` +
+      `worktree ${V2}/wt3\nHEAD ${V2_FEAT}\nbranch refs/heads/wt3\n\n`,
+  ),
+  'symbolic-ref --short refs/remotes/origin/HEAD': ok('origin/main\n'),
+  'rev-parse --verify --quiet origin/main^{commit}': ok(`${V2_MAIN}\n`),
+  'rev-parse --verify --quiet main^{commit}': ok(`${V2_MAIN}\n`),
+  'rev-parse --verify --quiet origin/feat/x^{commit}': ok(`${V2_FEAT}\n`),
+  'rev-parse --verify --quiet feat/x^{commit}': ok(`${V2_HEAD}\n`),
+  'rev-parse --verify --quiet wt3^{commit}': ok(`${V2_FEAT}\n`),
+  'rev-parse --verify --quiet gone/trunk^{commit}': NOT_A_COMMIT,
+  ...overrides,
+})
+
+describe('resolveBase: the main checkout', () => {
+  const ctx = (trunk: string | null = null) => ({ root: `${V2}/repo`, branch: 'feat/x', isLinked: false, trunk })
+
+  test('1. an override beats the trunk', async () => {
+    const { deps } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, ctx('origin/main'), 'feat/x')).toEqual({ ref: 'feat/x', source: 'override' })
+  })
+
+  test('2. a live reflog beats the trunk: feature work in the main checkout is unchanged', async () => {
+    const { deps } = fakeDeps(
+      v2Table({ 'reflog show --format=%gs refs/heads/feat/x': ok('commit: unpushed 2\nbranch: Created from main\n') }),
+    )
+    expect(await resolveBase(deps, ctx('origin/main'))).toEqual({ ref: 'main', source: 'reflog' })
+  })
+
+  test('2. on the trunk itself the reflog is skipped: what is not pushed', async () => {
+    for (const trunk of ['refs/remotes/origin/feat/x', 'refs/heads/feat/x']) {
+      const { deps, calls } = fakeDeps(
+        v2Table({ 'reflog show --format=%gs refs/heads/feat/x': ok('commit: unpushed 2\nbranch: Created from main\n') }),
+      )
+      expect(await resolveBase(deps, ctx(trunk))).toEqual({ ref: 'origin/feat/x', source: 'upstream' })
+      expect(calls.some(c => c.key.startsWith('reflog'))).toBe(false)
+    }
+  })
+
+  test('2. `Created from HEAD`: the branch HEAD left, from its reflog, beats the own upstream', async () => {
+    const { deps } = fakeDeps(
+      v2Table({
+        'reflog show --format=%gs refs/heads/feat/x': ok('commit: y2\ncommit: y1\nbranch: Created from HEAD\n'),
+        'reflog show --format=%gs HEAD': ok('commit: y2\ncommit: y1\ncheckout: moving from main to feat/x\n'),
+      }),
+    )
+    expect(await resolveBase(deps, ctx())).toEqual({ ref: 'main', source: 'reflog' })
+  })
+
+  test('2. `Created from HEAD` with nothing to recover: the default branch, never the own upstream', async () => {
+    for (const head of ['commit: y1\n', `checkout: moving from ${V2_MAIN} to feat/x\n`, 'checkout: moving from gone to feat/x\n']) {
+      const { deps, calls } = fakeDeps(
+        v2Table({
+          'reflog show --format=%gs refs/heads/feat/x': ok('commit: y1\nbranch: Created from HEAD\n'),
+          'reflog show --format=%gs HEAD': ok(head),
+          'rev-parse --verify --quiet gone^{commit}': NOT_A_COMMIT,
+        }),
+      )
+      expect(await resolveBase(deps, ctx())).toEqual({ ref: 'origin/main', source: 'default-branch' })
+      expect(calls.some(c => c.key.includes('@{upstream}'))).toBe(false)
+    }
+  })
+
+  test('2. `Created from HEAD` with nothing to recover still takes a trunk', async () => {
+    const { deps } = fakeDeps(
+      v2Table({
+        'reflog show --format=%gs refs/heads/feat/x': ok('branch: Created from HEAD\n'),
+        'reflog show --format=%gs HEAD': ok(''),
+      }),
+    )
+    expect(await resolveBase(deps, ctx('origin/main'))).toEqual({ ref: 'origin/main', source: 'trunk' })
+  })
+
+  test('2. `Created from @{-1}` is not read back from HEAD: the default branch', async () => {
+    const { deps, calls } = fakeDeps(
+      v2Table({ 'reflog show --format=%gs refs/heads/feat/x': ok('branch: Created from @{-1}\n') }),
+    )
+    expect(await resolveBase(deps, ctx())).toEqual({ ref: 'origin/main', source: 'default-branch' })
+    expect(calls.some(c => c.key === 'reflog show --format=%gs HEAD')).toBe(false)
+  })
+
+  test('2. a reflog naming its own copy falls through', async () => {
+    // `git checkout feat/x` DWIM in a fresh clone writes the full remote name.
+    for (const created of ['origin/feat/x', 'refs/remotes/origin/feat/x']) {
+      const { deps } = fakeDeps(
+        v2Table({ 'reflog show --format=%gs refs/heads/feat/x': ok(`branch: Created from ${created}\n`) }),
+      )
+      expect(await resolveBase(deps, ctx())).toEqual({ ref: 'origin/feat/x', source: 'upstream' })
+    }
+  })
+
+  test('3. a trunk on another branch is the base', async () => {
+    const { deps, calls } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, ctx('origin/main'))).toEqual({ ref: 'origin/main', source: 'trunk' })
+    expect(calls.some(c => c.key.includes('@{upstream}'))).toBe(false)
+  })
+
+  for (const trunk of ['origin/feat/x', 'feat/x', 'refs/remotes/origin/feat/x', 'refs/heads/feat/x']) {
+    test(`3. the trunk ${trunk} is this branch or its copy: skipped for the upstream`, async () => {
+      const { deps, calls } = fakeDeps(v2Table())
+      expect(await resolveBase(deps, ctx(trunk))).toEqual({ ref: 'origin/feat/x', source: 'upstream' })
+      expect(calls.some(c => c.key === `rev-parse --verify --quiet ${trunk}^{commit}`)).toBe(false)
+    })
+  }
+
+  test('3. a trunk that names no commit any more is skipped', async () => {
+    const { deps } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, ctx('gone/trunk'))).toEqual({ ref: 'origin/feat/x', source: 'upstream' })
+  })
+
+  test('4. the integration branch, reflog expired, upstream its own copy: what is not pushed', async () => {
+    const { deps, calls } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, ctx())).toEqual({ ref: 'origin/feat/x', source: 'upstream' })
+    // The main worktree's branch is this one: never asked.
+    expect(calls.some(c => c.key.startsWith('worktree list'))).toBe(false)
+  })
+
+  test('5. no upstream: the default branch', async () => {
+    const { deps, calls } = fakeDeps(
+      v2Table({ 'rev-parse --abbrev-ref feat/x@{upstream}': fail(128, "fatal: no upstream configured for branch 'feat/x'\n") }),
+    )
+    expect(await resolveBase(deps, ctx())).toEqual({ ref: 'origin/main', source: 'default-branch' })
+    expect(calls.some(c => c.key.startsWith('worktree list'))).toBe(false)
+  })
+
+  test('a detached HEAD takes the trunk', async () => {
+    const { deps } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, { ...ctx('origin/feat/x'), branch: null })).toEqual({
+      ref: 'origin/feat/x',
+      source: 'trunk',
+    })
+  })
+
+  test('a trunk that reads as an option is never passed to git', async () => {
+    const { deps, calls } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, ctx('--all'))).toEqual({ ref: 'origin/feat/x', source: 'upstream' })
+    expect(calls.some(c => c.key.includes('--all'))).toBe(false)
+  })
+})
+
+describe('resolveBase: a linked worktree and the trunk', () => {
+  const wt1 = (trunk: string | null = null) => ({ root: `${V2}/wt1`, branch: 'wt1', isLinked: true, trunk })
+  const wt3 = (trunk: string | null = null) => ({ root: `${V2}/wt3`, branch: 'wt3', isLinked: true, trunk })
+
+  test('2. the reflog beats the trunk', async () => {
+    const { deps } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, wt1('origin/main'))).toEqual({ ref: 'origin/feat/x', source: 'reflog' })
+  })
+
+  test('3. the upstream beats the trunk', async () => {
+    const { deps } = fakeDeps(v2Table({ 'reflog show --format=%gs refs/heads/wt1': ok('') }))
+    expect(await resolveBase(deps, wt1('origin/main'))).toEqual({ ref: 'origin/feat/x', source: 'upstream' })
+  })
+
+  test('4. reflog lost, no upstream: the trunk beats the main worktree', async () => {
+    const { deps, calls } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, wt3('origin/feat/x'))).toEqual({ ref: 'origin/feat/x', source: 'trunk' })
+    expect(calls.some(c => c.key.startsWith('worktree list'))).toBe(false)
+  })
+
+  test('5. without a trunk, the main worktree', async () => {
+    const { deps } = fakeDeps(v2Table())
+    expect(await resolveBase(deps, wt3())).toEqual({ ref: 'feat/x', source: 'main-worktree' })
+  })
+
+  test('4. a trunk that is this branch, or names no commit, falls to the main worktree', async () => {
+    for (const trunk of ['wt3', 'origin/wt3', 'gone/trunk']) {
+      const { deps } = fakeDeps(v2Table())
+      expect(await resolveBase(deps, wt3(trunk))).toEqual({ ref: 'feat/x', source: 'main-worktree' })
+    }
+  })
+
+  test('4. a trunk stored as the local branch team/wt3 is no copy of wt3', async () => {
+    const { deps } = fakeDeps(v2Table({ 'rev-parse --verify --quiet team/wt3^{commit}': ok(`${V2_MAIN}\n`) }))
+    expect(await resolveBase(deps, wt3('refs/heads/team/wt3'))).toEqual({ ref: 'team/wt3', source: 'trunk' })
+  })
+
+  test('4. a trunk stored as the remote branch team/wt3 is its copy', async () => {
+    for (const trunk of ['refs/remotes/team/wt3', 'refs/heads/wt3']) {
+      const { deps } = fakeDeps(v2Table())
+      expect(await resolveBase(deps, wt3(trunk))).toEqual({ ref: 'feat/x', source: 'main-worktree' })
+    }
+  })
+
+  test('4. a trunk that moves with HEAD is never compared against', async () => {
+    for (const trunk of ['HEAD', '@', 'HEAD~2', 'main~1', '@{u}', '@{-1}', 'FETCH_HEAD']) {
+      const { deps, calls } = fakeDeps(v2Table())
+      expect(await resolveBase(deps, wt3(trunk))).toEqual({ ref: 'feat/x', source: 'main-worktree' })
+      expect(calls.some(c => c.key === `rev-parse --verify --quiet ${trunk}^{commit}`)).toBe(false)
+    }
+  })
+})
+
+describe('isTrunkOwnCopy', () => {
+  test('a full local name is compared whole; a remote or short name drops its remote', () => {
+    expect(isTrunkOwnCopy('refs/heads/team/x', 'x')).toBe(false)
+    expect(isTrunkOwnCopy('refs/heads/release/1.2', '1.2')).toBe(false)
+    expect(isTrunkOwnCopy('refs/heads/x', 'x')).toBe(true)
+    expect(isTrunkOwnCopy('refs/remotes/team/x', 'x')).toBe(true)
+    expect(isTrunkOwnCopy('refs/remotes/origin/feat/x', 'feat/x')).toBe(true)
+    expect(isTrunkOwnCopy('refs/remotes/origin/main', 'feat/x')).toBe(false)
+    expect(isTrunkOwnCopy('origin/x', 'x')).toBe(true)
   })
 })
 
@@ -525,6 +807,7 @@ describe('computeSnapshot', () => {
       cwd: `${ROOT}/src`,
       isRepo: true,
       root: ROOT,
+      gitCommonDir: `${REPO}/.git`,
       isLinkedWorktree: true,
       branch: 'feat',
       head: 'e47b652',
@@ -844,7 +1127,42 @@ describe('computeSnapshot', () => {
       }),
       featFiles,
     )
-    expect((await computeSnapshot(deps, { cwd: ROOT, mode: 'all' })).isLinkedWorktree).toBe(false)
+    const snapshot = await computeSnapshot(deps, { cwd: ROOT, mode: 'all' })
+    expect(snapshot.isLinkedWorktree).toBe(false)
+    expect(snapshot.gitCommonDir).toBe(`${ROOT}/.git`)
+  })
+
+  test('the common dir is absolute whichever way git answered', async () => {
+    expect(commonDirOf(`${REPO}/.git/worktrees/t1-wt\n${REPO}/.git\n`, ROOT)).toBe(`${REPO}/.git`)
+    expect(commonDirOf(`${REPO}/.git\n${REPO}/.git\n`, REPO)).toBe(`${REPO}/.git`)
+    expect(commonDirOf('--path-format=absolute\n.git\n.git\n', REPO)).toBe(`${REPO}/.git`)
+    expect(commonDirOf(`--path-format=absolute\n${REPO}/.git/worktrees/t1-wt\n${REPO}/.git/worktrees/t1-wt/../..\n`, ROOT)).toBe(
+      `${REPO}/.git`,
+    )
+    expect(commonDirOf('', ROOT)).toBe('')
+  })
+
+  test('repoDirs: the root and the common dir, as a snapshot finds them', async () => {
+    expect(await repoDirs(fakeDeps(featTable()).deps, `${ROOT}/src`)).toEqual({ root: ROOT, gitCommonDir: `${REPO}/.git` })
+    expect(await repoDirs(fakeDeps({ 'rev-parse --show-toplevel': NOT_A_REPO }).deps, '/w/t1-notrepo')).toBeNull()
+    const noDirs = featTable({ 'rev-parse --path-format=absolute --git-dir --git-common-dir': fail(128, 'fatal: bad\n') })
+    expect(await repoDirs(fakeDeps(noDirs).deps, ROOT)).toEqual({ root: ROOT, gitCommonDir: '' })
+  })
+
+  test('the trunk reaches the base: a linked worktree whose reflog is lost', async () => {
+    const { deps } = fakeDeps(
+      featTable({
+        'reflog show --format=%gs refs/heads/feat': ok(''),
+        'rev-parse --verify --quiet origin/main^{commit}': ok(`${MAIN_SHA}\n`),
+        'merge-base origin/main HEAD': ok(`${MB}\n`),
+        'rev-list --left-right --count origin/main...HEAD': ok('1\t1\n'),
+      }),
+      featFiles,
+    )
+    const snapshot = await computeSnapshot(deps, { cwd: ROOT, mode: 'all', trunk: 'origin/main' })
+    expect(snapshot.error).toBeUndefined()
+    expect(snapshot.base).toEqual({ ref: 'origin/main', source: 'trunk', mergeBase: MB })
+    expect(summaryText(snapshot).split('\n')[0]).toBe('feat → origin/main   trunk · 73481c5')
   })
 
   test('a failing diff and a runner that rejects both land in error', async () => {

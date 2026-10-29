@@ -9,8 +9,20 @@ import type {
   Timer,
 } from 'claude-code'
 
-import type { DiffMode, FileChange, FileDiff, Snapshot } from '../types'
-import { computeSnapshot, git, loadFileDiff, summaryText, type GitDeps, type UntrackedCache } from './git'
+import type { DiffMode, FileChange, FileDiff, Snapshot, ViewMode } from '../types'
+import {
+  computeSnapshot,
+  git,
+  loadFileDiff,
+  repoDirs,
+  shortRef,
+  stableStartPoint,
+  summaryText,
+  type GitDeps,
+  type RepoDirs,
+  type UntrackedCache,
+} from './git'
+import { buildTree, dirPaths, isAllFolded, visibleRows, type Tree, type TreeDir } from './tree'
 
 type Dollar = EngineInterface
 type Ui = Pick<Elements['terminal'], 'Box' | 'Text' | 'Button' | 'Code'>
@@ -36,18 +48,20 @@ const TRIGGER_TOOLS = new Set([
   'EnterWorktree',
   'ExitWorktree',
 ])
+const ARGUMENT_HINT = '[status | refresh | base [<ref>] | trunk [<ref>] | mode all|committed|uncommitted]'
 export const USAGE = [
-  'Usage: /wt-diff [status | refresh | base [<ref>] | mode all|committed|uncommitted]',
+  `Usage: /wt-diff ${ARGUMENT_HINT}`,
   '  /wt-diff              open or close the Changes pane',
   '  /wt-diff status       print the changes as text',
   '  /wt-diff refresh      re-read git now',
   '  /wt-diff base <ref>   compare this worktree against <ref>; /wt-diff base clears it',
+  "  /wt-diff trunk <ref>  the repository's integration branch, for all its worktrees; /wt-diff trunk clears it",
   '  /wt-diff mode <mode>  all (default), committed or uncommitted',
 ].join('\n')
 
 // Change a tag when its value's shape changes: an older value then reads as the initial.
 const snapshotAtom = atom({ plugin: 'worktree-diff', key: 'snapshot' } as const, null, {
-  shape: 'snapshot-1',
+  shape: 'snapshot-2',
 })
 const modeAtom = atom({ plugin: 'worktree-diff', key: 'mode' } as const, 'all')
 const expandedAtom = atom({ plugin: 'worktree-diff', key: 'expanded' } as const, [], {
@@ -57,6 +71,10 @@ const diffsAtom = atom({ plugin: 'worktree-diff', key: 'diffs' } as const, {}, {
   shape: 'diffs-1',
 })
 const refreshingAtom = atom({ plugin: 'worktree-diff', key: 'isRefreshing' } as const, false)
+const viewAtom = atom({ plugin: 'worktree-diff', key: 'view' } as const, 'tree')
+const collapsedAtom = atom({ plugin: 'worktree-diff', key: 'collapsedDirs' } as const, [], {
+  shape: 'collapsed-1',
+})
 
 // ----------------------------------------------------------------- config
 
@@ -254,23 +272,23 @@ const gitDeps = ($: Dollar): GitDeps => ({
   untrackedCache,
 })
 
-const topLevel = async (deps: GitDeps, cwd: string): Promise<string | null> => {
-  const top = await git(deps, cwd, ['rev-parse', '--show-toplevel'])
-  const root = top.stdout.trim()
-
-  return top.exitCode === 0 && root !== '' ? root : null
-}
-
+// A base override is the worktree's own; the trunk is the repository's, shared by its worktrees.
 const baseKey = (root: string) => `base:${root}`
+const trunkKey = (gitCommonDir: string) => `trunk:${gitCommonDir}`
 
-const storedBase = async ($: Dollar, root: string): Promise<string | null> => {
+const storedRef = async ($: Dollar, key: string): Promise<string | null> => {
   try {
-    const value = await $.store.get(baseKey(root))
+    const value = await $.store.get(key)
     return typeof value === 'string' && value !== '' ? value : null
   } catch {
     return null
   }
 }
+
+// The person's choice of view, kept across sessions; state mirrors it for drawing.
+const VIEW_KEY = 'view'
+
+export const isView = (value: unknown): value is ViewMode => value === 'tree' || value === 'list'
 
 // --------------------------------------------------------------- register
 
@@ -289,6 +307,10 @@ let isVisible = false
 let wantsAutoOpen = false
 /** Whether the surface docks a pane beside the transcript; undefined until a drawing says. */
 let docksPanes: boolean | undefined
+/** Whether this load of the module has mirrored the stored view into state. */
+let isViewLoaded = false
+/** Presses of `t` this load of the module: a read of the store begun before one is stale. */
+let viewToggles = 0
 // Losing it costs one more read of each untracked file.
 const untrackedCache: UntrackedCache = new Map()
 
@@ -380,7 +402,33 @@ const syncDiffs = async ($: Dollar, deps: GitDeps, snapshot: Snapshot) => {
   })
 }
 
+/** Mirrors the stored view into state, once per load of the module. */
+const loadView = async ($: Dollar) => {
+  if (isViewLoaded) return
+  isViewLoaded = true
+  const toggles = viewToggles
+  let stored: unknown
+  try {
+    stored = await $.store.get(VIEW_KEY)
+  } catch {
+    return
+  }
+  // A `t` pressed while the store answered has written its own choice.
+  if (toggles !== viewToggles) return
+  if (isView(stored) && stored !== (await read($, viewAtom))) await update($, viewAtom, () => stored)
+}
+
+/** Drops collapsed directories the snapshot no longer has. */
+const pruneCollapsed = async ($: Dollar, snapshot: Snapshot) => {
+  const collapsed = await read($, collapsedAtom)
+  if (collapsed.length === 0) return
+  const live = new Set(dirPaths(buildTree(snapshot.files)))
+  if (collapsed.every(path => live.has(path))) return
+  await update($, collapsedAtom, paths => paths.filter(path => live.has(path)))
+}
+
 const refreshOnce = async ($: Dollar, force: boolean): Promise<Snapshot | null> => {
+  await loadView($)
   const pane = await paneState($)
   const isOpen = pane !== undefined
   if (pane?.isPlaced && pane.isShown) startPolling($)
@@ -393,12 +441,13 @@ const refreshOnce = async ($: Dollar, force: boolean): Promise<Snapshot | null> 
   const cwd = await $.session.cwd()
   const mode = await read($, modeAtom)
   const previous = await read($, snapshotAtom)
-  const root =
-    previous !== null && previous.cwd === cwd && previous.isRepo
-      ? previous.root
-      : await topLevel(deps, cwd)
-  const baseOverride = root === null ? null : await storedBase($, root)
-  const snapshot = await computeSnapshot(deps, { cwd, mode, baseOverride })
+  const dirs: RepoDirs | null =
+    previous !== null && previous.cwd === cwd && previous.isRepo && previous.gitCommonDir !== ''
+      ? previous
+      : await repoDirs(deps, cwd)
+  const baseOverride = dirs === null ? null : await storedRef($, baseKey(dirs.root))
+  const trunk = dirs === null || dirs.gitCommonDir === '' ? null : await storedRef($, trunkKey(dirs.gitCommonDir))
+  const snapshot = await computeSnapshot(deps, { cwd, mode, baseOverride, trunk })
 
   if ((await read($, modeAtom)) !== mode) {
     // The mode moved while git ran: this result is the old mode's.
@@ -407,7 +456,10 @@ const refreshOnce = async ($: Dollar, force: boolean): Promise<Snapshot | null> 
   }
   if (previous?.signature !== snapshot.signature) await update($, snapshotAtom, () => snapshot)
   // A failed read lists nothing: keep what is open until git answers again.
-  if (snapshot.error === undefined || snapshot.files.length > 0) await syncDiffs($, deps, snapshot)
+  if (snapshot.error === undefined || snapshot.files.length > 0) {
+    await syncDiffs($, deps, snapshot)
+    await pruneCollapsed($, snapshot)
+  }
   if (config.statusLine) $.ui.status(statusLineText(snapshot))
   // Until a drawing says whether panes dock, the open stays pending.
   if (wantsAutoOpen && (isOpen || docksPanes !== undefined)) {
@@ -481,30 +533,90 @@ const collapseAll = async ($: Dollar) => {
   await update($, diffsAtom, () => ({}))
 }
 
+const toggleView = async ($: Dollar) => {
+  isViewLoaded = true
+  viewToggles += 1
+  await update($, viewAtom, view => (view === 'tree' ? 'list' : 'tree'))
+  try {
+    await $.store.set(VIEW_KEY, await read($, viewAtom))
+  } catch {
+    // Kept for this session only.
+  }
+}
+
+const toggleDir = async ($: Dollar, path: string) => {
+  await update($, collapsedAtom, paths =>
+    paths.includes(path) ? paths.filter(one => one !== path) : [...paths, path],
+  )
+}
+
+/** Collapses every directory, nested ones too, or expands them all when the tree reads as all folded. */
+const foldAll = async ($: Dollar) => {
+  const snapshot = await read($, snapshotAtom)
+  if (snapshot === null) return
+  const tree = buildTree(snapshot.files)
+  await update($, collapsedAtom, paths => (isAllFolded(tree, paths) ? [] : dirPaths(tree)))
+}
+
 const setMode = async ($: Dollar, mode: DiffMode) => {
   await update($, modeAtom, () => mode)
   await update($, diffsAtom, () => ({}))
   await refresh($, { force: true, isVisible: true })
 }
 
+/** Why `ref` cannot be stored as a base or trunk, checked in the worktree `root`; null when it can. */
+const refProblem = async (deps: GitDeps, root: string, ref: string): Promise<string | null> => {
+  if (ref.startsWith('-')) return `Not a ref: ${ref}`
+  const check = await git(deps, root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])
+
+  return check.exitCode === 0 ? null : `Not a commit here: ${ref}`
+}
+
 const setBase = async ($: Dollar, ref: string | undefined): Promise<string> => {
   const deps = gitDeps($)
   const cwd = await $.session.cwd()
-  const root = await topLevel(deps, cwd)
-  if (root === null) return `Not a git repository: ${cwd}`
+  const dirs = await repoDirs(deps, cwd)
+  if (dirs === null) return `Not a git repository: ${cwd}`
+  const { root } = dirs
 
   if (ref === undefined) {
     await $.store.delete(baseKey(root))
     await refresh($, { force: true, isVisible: true })
     return `Base override cleared for ${root}.`
   }
-  if (ref.startsWith('-')) return `Not a ref: ${ref}`
-  const check = await git(deps, root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])
-  if (check.exitCode !== 0) return `Not a commit here: ${ref}`
+  const problem = await refProblem(deps, root, ref)
+  if (problem !== null) return problem
   await $.store.set(baseKey(root), ref)
   await refresh($, { force: true, isVisible: true })
 
   return `Base set to ${ref} for ${root}.`
+}
+
+const setTrunk = async ($: Dollar, ref: string | undefined): Promise<string> => {
+  const deps = gitDeps($)
+  const cwd = await $.session.cwd()
+  const dirs = await repoDirs(deps, cwd)
+  if (dirs === null) return `Not a git repository: ${cwd}`
+  const { root, gitCommonDir } = dirs
+  if (gitCommonDir === '') return `Could not find the git directory of ${root}.`
+
+  if (ref === undefined) {
+    await $.store.delete(trunkKey(gitCommonDir))
+    await refresh($, { force: true, isVisible: true })
+    return `Trunk cleared for ${gitCommonDir}.`
+  }
+  const problem = await refProblem(deps, root, ref)
+  if (problem !== null) return problem
+  // Shared by every worktree, it must name the same thing in each.
+  if (stableStartPoint(ref) !== ref) return `Not a branch name: ${ref}`
+  // A branch by its full name, so `team/x` is never read as remote team's `x`.
+  const full = await git(deps, root, ['rev-parse', '--symbolic-full-name', ref])
+  const fullName = full.exitCode === 0 ? full.stdout.trim() : ''
+  const stored = /^refs\/(?:heads|remotes)\//.test(fullName) ? fullName : ref
+  await $.store.set(trunkKey(gitCommonDir), stored)
+  await refresh($, { force: true, isVisible: true })
+
+  return `Trunk set to ${shortRef(stored)} for every worktree of ${gitCommonDir}.`
 }
 
 const togglePane = async ($: Dollar) => {
@@ -537,6 +649,8 @@ const runCommand = async ($: Dollar, args: string): Promise<string> => {
     }
     case 'base':
       return rest.length > 1 ? USAGE : setBase($, rest[0])
+    case 'trunk':
+      return rest.length > 1 ? USAGE : setTrunk($, rest[0])
     case 'mode': {
       const mode = rest[0] ?? ''
       if (rest.length !== 1 || !isMode(mode)) return USAGE
@@ -555,7 +669,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'wt-diff',
       description: 'Show what this worktree changed versus the branch it came from',
-      argumentHint: '[status | refresh | base [<ref>] | mode all|committed|uncommitted]',
+      argumentHint: ARGUMENT_HINT,
       // Watching Claude's edits land is the point: none of it needs the turn over.
       immediate: true,
     })
@@ -626,12 +740,14 @@ export const register: Register = (on, options) => {
     const ui: Ui = $.ui.resolve(e)
     learnLayout($, e.viewport?.isFullscreen)
     startPolling($)
-    const [snapshot, mode, expanded, diffs, isRefreshing] = await Promise.all([
+    const [snapshot, mode, expanded, diffs, isRefreshing, view, collapsedDirs] = await Promise.all([
       read($, snapshotAtom),
       read($, modeAtom),
       read($, expandedAtom),
       read($, diffsAtom),
       read($, refreshingAtom),
+      read($, viewAtom),
+      read($, collapsedAtom),
     ])
 
     return drawPane(ui, {
@@ -640,12 +756,17 @@ export const register: Register = (on, options) => {
       expanded,
       diffs,
       isRefreshing,
+      view,
+      collapsedDirs,
       columns: Math.max(16, e.props.bodyColumns),
       surface: e.surface,
       onMode: picked => background(setMode($, picked)),
       onRefresh: () => background(refresh($, { force: true, isVisible: true })),
       onCollapse: () => background(collapseAll($)),
       onToggle: path => background(toggleFile($, path)),
+      onView: () => background(toggleView($)),
+      onDir: path => background(toggleDir($, path)),
+      onFold: () => background(foldAll($)),
     })
   })
 }
@@ -658,12 +779,17 @@ type PaneModel = {
   expanded: readonly string[]
   diffs: Readonly<Record<string, FileDiff>>
   isRefreshing: boolean
+  view: ViewMode
+  collapsedDirs: readonly string[]
   columns: number
   surface: RenderSurface
   onMode: (mode: DiffMode) => void
   onRefresh: () => void
   onCollapse: () => void
   onToggle: (path: string) => void
+  onView: () => void
+  onDir: (path: string) => void
+  onFold: () => void
 }
 
 /**
@@ -726,8 +852,9 @@ const drawHeader = (ui: Ui, model: PaneModel, snapshot: Snapshot): RenderElement
 }
 
 // `plain` draws each hotkey beside its label (`a: all`); the current mode is
-// bold there, and `primary` wherever a surface draws its own buttons.
-const drawControls = (ui: Ui, model: PaneModel): RenderElement => {
+// bold there, and `primary` wherever a surface draws its own buttons. The view
+// and fold buttons are named for what a press does, as refresh and collapse are.
+const drawControls = (ui: Ui, model: PaneModel, tree: Tree | null): RenderElement => {
   const { Box, Button, Text } = ui
 
   return (
@@ -756,6 +883,16 @@ const drawControls = (ui: Ui, model: PaneModel): RenderElement => {
         ),
       )}
       <Button key="refresh" label="refresh" hotkey="r" plain onPress={model.onRefresh} />
+      <Button key="view" label={model.view === 'tree' ? 'list' : 'tree'} hotkey="t" plain onPress={model.onView} />
+      {tree !== null && tree.dirs.length > 0 ? (
+        <Button
+          key="fold"
+          label={isAllFolded(tree, model.collapsedDirs) ? 'unfold' : 'fold'}
+          hotkey="z"
+          plain
+          onPress={model.onFold}
+        />
+      ) : null}
       {model.expanded.length > 0 ? (
         <Button key="collapse" label="collapse" hotkey="x" plain onPress={model.onCollapse} />
       ) : null}
@@ -776,44 +913,134 @@ const emptyText = (snapshot: Snapshot): string | null => {
     : `No changes vs ${snapshot.base.ref}`
 }
 
-const drawRow = (ui: Ui, model: PaneModel, file: FileChange): RenderElement => {
+/**
+ * Leading cells of a tree row at `depth`: two a level, at most a third of the
+ * width, and never the cells the rest of the row (`rest`) needs.
+ */
+const indentCells = (depth: number, columns: number, rest: number): number =>
+  Math.max(0, Math.min(depth * 2, Math.floor(columns / 3), columns - rest))
+
+/** The indent as label text: spaces where cells are monospace, none where a native button would drop them. */
+const indentText = (model: PaneModel, cells: number): string => (model.surface === 'terminal' ? ' '.repeat(cells) : '')
+
+/** Elsewhere a row is indented by its Box: a number of cells on every surface. */
+const indented = (ui: Ui, model: PaneModel, cells: number, key: string, row: RenderElement): RenderElement => {
+  const { Box } = ui
+  if (model.surface === 'terminal' || cells === 0) return row
+
+  return (
+    <Box key={`at:${key}`} paddingLeft={cells}>
+      {row}
+    </Box>
+  )
+}
+
+/** The fewest cells a row's name keeps. */
+const NAME_MIN = 4
+
+/** Right-aligns what follows where cells are monospace. */
+const gapBefore = (model: PaneModel, used: number, countsLen: number): string =>
+  model.surface === 'terminal' ? ' '.repeat(Math.max(1, model.columns - used - countsLen)) : '  '
+
+const pushCounts = (children: (string | RenderElement)[], ui: Ui, counts: Counts, isDim = false) => {
+  const { Text } = ui
+  if (counts.added !== undefined) {
+    children.push(isDim ? <Text dimColor>{counts.added}</Text> : <Text color="success">{counts.added}</Text>)
+  }
+  if (counts.added !== undefined && counts.removed !== undefined) children.push(' ')
+  if (counts.removed !== undefined) {
+    children.push(isDim ? <Text dimColor>{counts.removed}</Text> : <Text color="error">{counts.removed}</Text>)
+  }
+  if (counts.other !== undefined) children.push(<Text dimColor>{counts.other}</Text>)
+}
+
+/** In the tree: where the row sits and the name it shows. */
+type Place = { depth: number; name: string }
+
+const drawRow = (ui: Ui, model: PaneModel, file: FileChange, place?: Place): RenderElement => {
   const { Button, Text } = ui
   // The snapshot's own mode: a switch shows the old rows until git answers.
   const mark = model.snapshot?.mode === 'all' ? (file.layer === 'committed' ? '  ' : '● ') : ''
-  const lead = `${file.status} ${mark}`
   const counts = countParts(file)
   const countsLen = countsWidth(counts)
-  const room = Math.max(4, model.columns - lead.length - (countsLen > 0 ? countsLen + 1 : 0))
-  const path = oneLine(file.path)
-  let name = fitPath(path, room)
-  if (file.oldPath !== undefined) {
-    const oldPath = oneLine(file.oldPath)
-    const whole = `${oldPath} → ${path}`
-    const half = Math.max(2, Math.floor((room - 3) / 2))
-    name = cellWidth(whole) <= room ? whole : `${fitPath(oldPath, half)} → ${fitPath(path, room - 3 - half)}`
+  const tail = countsLen > 0 ? countsLen + 1 : 0
+  const own = `${file.status} ${mark}`.length
+  const cells = place === undefined ? 0 : indentCells(place.depth, model.columns, own + tail + NAME_MIN)
+  const indent = indentText(model, cells)
+  const lead = `${indent}${file.status} ${mark}`
+  const room = Math.max(NAME_MIN, model.columns - cells - own - tail)
+  let name: string
+  // A rename in the tree: the name first, where it came from in what room is left.
+  let from = ''
+  if (place !== undefined) {
+    name = fitPath(oneLine(place.name), room)
+    const left = room - cellWidth(name) - 3
+    if (file.oldPath !== undefined && left >= 4) from = ` ← ${fitPath(oneLine(file.oldPath), left)}`
+  } else {
+    const path = oneLine(file.path)
+    name = fitPath(path, room)
+    if (file.oldPath !== undefined) {
+      const oldPath = oneLine(file.oldPath)
+      const whole = `${oldPath} → ${path}`
+      const half = Math.max(2, Math.floor((room - 3) / 2))
+      name = cellWidth(whole) <= room ? whole : `${fitPath(oldPath, half)} → ${fitPath(path, room - 3 - half)}`
+    }
   }
   const statusColor = STATUS_COLOR[file.status]
 
   // A Button holds strings and Text only.
-  const children: (string | RenderElement)[] = [
+  const children: (string | RenderElement)[] = []
+  if (indent !== '') children.push(indent)
+  children.push(
     statusColor ? <Text color={statusColor}>{file.status}</Text> : <Text dimColor>{file.status}</Text>,
     ` ${mark}`,
     model.expanded.includes(file.path) ? <Text bold>{name}</Text> : name,
-  ]
-  if (countsLen > 0) {
-    // Right-align the counts where cells are monospace.
-    const gap = model.columns - lead.length - cellWidth(name) - countsLen
-    children.push(model.surface === 'terminal' ? ' '.repeat(Math.max(1, gap)) : '  ')
-  }
-  if (counts.added !== undefined) children.push(<Text color="success">{counts.added}</Text>)
-  if (counts.added !== undefined && counts.removed !== undefined) children.push(' ')
-  if (counts.removed !== undefined) children.push(<Text color="error">{counts.removed}</Text>)
-  if (counts.other !== undefined) children.push(<Text dimColor>{counts.other}</Text>)
+  )
+  if (from !== '') children.push(<Text dimColor>{from}</Text>)
+  if (countsLen > 0) children.push(gapBefore(model, lead.length + cellWidth(name) + cellWidth(from), countsLen))
+  pushCounts(children, ui, counts)
 
-  return (
-    <Button key={`file:${file.path}`} plain onPress={() => model.onToggle(file.path)}>
+  const key = `file:${file.path}`
+  return indented(
+    ui,
+    model,
+    cells,
+    key,
+    <Button key={key} plain onPress={() => model.onToggle(file.path)}>
       {children}
-    </Button>
+    </Button>,
+  )
+}
+
+const drawDirRow = (ui: Ui, model: PaneModel, dir: TreeDir, depth: number, isCollapsed: boolean): RenderElement => {
+  const { Button, Text } = ui
+  const counts: Counts = {}
+  if (dir.added > 0) counts.added = `+${dir.added}`
+  if (dir.removed > 0) counts.removed = `${MINUS}${dir.removed}`
+  const countsLen = countsWidth(counts)
+  // The arrow, the slash and the sums; a name first, then `(N)`, then the indent.
+  const fixed = 3 + (countsLen > 0 ? countsLen + 1 : 0)
+  const folded = ` (${dir.fileCount})`
+  const count = isCollapsed && model.columns - fixed - NAME_MIN >= folded.length ? folded : ''
+  const cells = indentCells(depth, model.columns, fixed + count.length + NAME_MIN)
+  const head = `${indentText(model, cells)}${isCollapsed ? '▸' : '▾'} `
+  const room = Math.max(NAME_MIN, model.columns - cells - fixed - count.length)
+  const label = `${head}${fitPath(oneLine(dir.name), room)}/`
+
+  const children: (string | RenderElement)[] = [label]
+  if (count !== '') children.push(<Text dimColor>{count}</Text>)
+  if (countsLen > 0) children.push(gapBefore(model, cellWidth(label) + count.length, countsLen))
+  pushCounts(children, ui, counts, true)
+
+  const key = `dir:${dir.path}`
+  return indented(
+    ui,
+    model,
+    cells,
+    key,
+    <Button key={key} plain onPress={() => model.onDir(dir.path)}>
+      {children}
+    </Button>,
   )
 }
 
@@ -879,8 +1106,9 @@ export const drawPane = (ui: Ui, model: PaneModel): RenderElement => {
     )
   }
 
+  const tree = model.view === 'tree' ? buildTree(snapshot.files) : null
   const body: RenderElement[] = drawHeader(ui, model, snapshot)
-  if (snapshot.head !== '') body.push(drawControls(ui, model))
+  if (snapshot.head !== '') body.push(drawControls(ui, model, tree))
   if (snapshot.error) body.push(<Text color="error">{`Error: ${oneLine(snapshot.error)}`}</Text>)
 
   const empty = emptyText(snapshot)
@@ -889,14 +1117,24 @@ export const drawPane = (ui: Ui, model: PaneModel): RenderElement => {
     return <Box flexDirection="column">{body}</Box>
   }
 
+  // A collapsed directory's files are no rows: they take none of the budget.
+  const rows =
+    tree === null
+      ? snapshot.files.map(file => ({ kind: 'file' as const, file }))
+      : visibleRows(tree, new Set(model.collapsedDirs))
   // Every row is padded to the width, so the rows still to come take their
   // share of the budget before a diff does: none of them is cut off the end.
   let used = 0
-  snapshot.files.forEach((file, index) => {
-    body.push(drawRow(ui, model, file))
+  rows.forEach((row, index) => {
     used += model.columns
+    if (row.kind === 'dir') {
+      body.push(drawDirRow(ui, model, row.dir, row.depth, row.isCollapsed))
+      return
+    }
+    const { file } = row
+    body.push(drawRow(ui, model, file, 'name' in row ? row : undefined))
     if (!model.expanded.includes(file.path)) return
-    const later = (snapshot.files.length - index - 1) * model.columns + TAIL_CHARS
+    const later = (rows.length - index - 1) * model.columns + TAIL_CHARS
     const drawn = drawDiff(ui, file, model.diffs[file.path], TEXT_BUDGET - used - later)
     body.push(drawn.node)
     used += drawn.chars
