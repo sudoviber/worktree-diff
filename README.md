@@ -2,11 +2,15 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A Claude Code mod that docks a **Changes** pane beside the conversation. It shows what the
-current git worktree changed compared with the branch it was created from: every file with
-its added and removed line counts in a tree on the left, and the diff of the file under the
-cursor in a region of its own on the right. The pane refreshes itself after Claude edits files
-or runs commands, so you can follow the branch's changes without switching to another tool.
+A Claude Code mod that docks a **Changes** pane beside the conversation. It shows what a git
+worktree changed compared with the branch it was created from: every file with its added and
+removed line counts in a tree on the left, and the diff of the file under the cursor in a
+region of its own on the right. The pane refreshes itself after Claude edits files or runs
+commands, so you can follow the branch's changes without switching to another tool.
+
+The worktree it shows is the one Claude works in, even when the session itself stays in the
+main checkout and Claude edits another worktree by its path or with `cd <worktree> && …`. You
+can also pin one yourself. See [Which worktree it shows](#which-worktree-it-shows).
 
 ```
 feat/login                                                                       ↑3 ↓1
@@ -29,7 +33,8 @@ j: down  k: up  l: open  w: diff  h: fold  q: close  d: page  b: back  g: top  e
 ```
 
 The header names the branch, how far it is ahead of its base (↑) and behind it (↓), and the
-base it is compared with. Under the actions, the line beneath the mode tabs marks the current
+base it is compared with. When the pane shows another worktree than the session's, a line
+above the branch names it (see [The place line](#the-place-line)). Under the actions, the line beneath the mode tabs marks the current
 mode, and the row after it sums up that mode's listing.
 
 Files are shown as a tree of folders by default. A chain of folders that each hold only one
@@ -115,9 +120,11 @@ Then run `/reload-plugins` in any open session to load the new version without r
 |---|---|
 | `/wt-diff` | Open the pane and give it the keyboard (a pane hidden behind another pane's tab is brought to the front) |
 | `/wt-diff close` | Close the pane |
-| `/wt-diff status` | Refresh, then print the changes as plain text |
+| `/wt-diff status` | Refresh, then print the changes of the worktree the pane shows as plain text |
 | `/wt-diff refresh` | Re-read git now |
-| `/wt-diff base <ref>` | Compare this worktree against `<ref>` from now on (kept across sessions) |
+| `/wt-diff at <path>` | Show the worktree at `<path>` instead of the one Claude works in (pin it) |
+| `/wt-diff at` | Unpin, and follow the worktree Claude works in again |
+| `/wt-diff base <ref>` | Compare the worktree the pane shows against `<ref>` from now on (kept across sessions) |
 | `/wt-diff base` | Forget that override and go back to the inferred base |
 | `/wt-diff trunk <ref>` | Name the repository's integration branch (for example `origin/feat/auth-ui`), shared by all its worktrees and kept across sessions |
 | `/wt-diff trunk` | Forget the integration branch |
@@ -126,7 +133,134 @@ Then run `/reload-plugins` in any open session to load the new version without r
 `/wt-diff` runs at once even while Claude is still working, so you can open the pane to watch
 edits as they land.
 
-`/wt-diff status` always prints a flat list.
+`/wt-diff status` always prints a flat list. When the pane shows another worktree than the
+session's, its first line is `⌂ <path> · auto` or `⌂ <path> · pinned`.
+
+### Which worktree it shows
+
+The pane shows one worktree at a time, the first of:
+
+1. **pinned**: a worktree you chose with `/wt-diff at <path>` or from the `o` list.
+2. **followed**: the worktree Claude last worked in, other than the session's own.
+3. **the session's**: the worktree the session's working directory is in.
+
+The pinned and the followed worktree last for the session: they survive `/reload-plugins`,
+and a new session starts with neither. Everything the pane does acts on the worktree it
+shows: refreshes and polling, `/wt-diff status`, `/wt-diff base` and `/wt-diff trunk`. A base
+set with `/wt-diff base` belongs to one worktree and a trunk to one repository, so each
+worktree is compared with its own.
+
+#### Following Claude
+
+After each of Claude's tool calls that ran (not denied, and not failed), subagents' calls
+included, the pane looks at where the call pointed:
+
+- **Edit**, **Write**, **MultiEdit**: the folder of `file_path`. **NotebookEdit**: the folder
+  of `notebook_path`. A file in a folder that does not exist yet counts from the nearest
+  folder above it that does.
+- **Bash**: where the `cd` (or `pushd`) commands at the start of the command land.
+  `cd ../app-login && npm test` follows `../app-login`, and `cd /code/app && cd wt; make`
+  follows `/code/app/wt`: each `cd` goes on from the one before, the first from the folder
+  the call started in. Quotes, `~` and `--` are understood. The whole command is passed over
+  when any of its leading `cd`s cannot be read for sure: a variable, `$(…)`, backticks, a
+  glob or braces, a redirection, a pipe, `||`, `&`, `cd -`, or more than one operand. A `cd`
+  after another command (`npm test && cd wt`) does not count, and `CDPATH` is not consulted.
+  A Bash call that failed after its `cd` ran (`cd wt && npm test` with a failing test, its
+  exit code in the result) is still followed, as long as the folder it landed in exists. A
+  call refused before it ran (you declined it, or a hook or permission rule denied it) is not.
+- Any other tool (Read, Grep, …): nothing.
+
+The folder is turned into the root of its worktree (`git rev-parse --show-toplevel`), and the
+pane follows it only if it belongs to the same repository as the session: one of its
+worktrees, sharing its git directory. So when Claude writes its memory under `~/.claude`, or
+edits a file in another repository, the pane stays where it is. With the session outside any
+git repository, a worktree of any repository is followed. If git cannot tell which repository
+the session is in (it timed out, say), the call is passed over.
+
+A call back in the session's own worktree stops following. EnterWorktree and ExitWorktree move
+the session itself, so once they change its folder the followed worktree is dropped and the
+pane shows the session's new one. The git commands this takes run after the tool's result has
+been handed back to Claude, one call after another, so the last call's worktree stands.
+
+#### Pinning
+
+- `/wt-diff at <path>` pins the worktree that `<path>` is in. The rest of the line is the path,
+  spaces included, with one pair of quotes around it taken off; a relative path is read from
+  the session's folder, and `~` is your home folder. Any git worktree can be pinned, of this
+  repository or another. The reply is `Showing <name> (pinned)`, or `Not a path: …` or
+  `Not a git worktree: …` when it cannot be shown.
+- `/wt-diff at` with nothing after it unpins, and the pane follows Claude again.
+- `o` in the pane opens the worktree list.
+
+A pin wins over a followed worktree, so the pane stays put while Claude works elsewhere.
+
+#### The worktree list
+
+`o` lists `auto` first, then every worktree of the session's repository (of the shown one's,
+when the session is in none), as `git worktree list` gives them. A bare repository and a
+worktree whose folder was deleted without `git worktree remove` are left out. In the side view
+the list takes the regions' place, under a ` worktrees ` head; in the inline view it takes the
+file list's place.
+
+```
+ worktrees
+› ✓ auto  follow Claude
+  • app-login  feat/login  /code/app-login
+    app  main  /code/app
+    app-fix  3f2a9c1  /code/app-fix
+```
+
+Each row has the cursor `›`, a mark, the worktree's folder name, its branch (the short commit
+for a detached `HEAD`) and its path, dim. On a narrow pane the path goes first, then the
+branch. `✓` marks what is in force: `auto` while nothing is pinned, else the pinned worktree.
+A dim `•` marks the worktree the pane shows, when it has no `✓`. The cursor starts on the `✓`.
+
+| Key | What it does |
+|---|---|
+| `j` / `k` | Move the cursor down / up |
+| `l` or `Enter` | Pick the row: `auto` unpins, a worktree is pinned |
+| `h` or `o` | Close the list and change nothing |
+| `q` | Close the pane |
+
+A click on a row picks it too. While the list shows, the bottom row lists its keys
+(`j: down  k: up  l: select  h: back  o: back  q: close`). Once it closes, the keys act where
+they did before.
+
+#### The place line
+
+While the pane shows another worktree than the session's, a dim line above the branch names
+it, with `auto` for a followed worktree and `pinned` for a pinned one:
+
+```
+⌂ app-login · auto
+feat/login                                                                       ↑3 ↓1
+vs main                                                               reflog · a1b2c3d
+```
+
+A pin on the session's own worktree shows the line too (`⌂ app · pinned`), so you can tell
+that the pane will not follow Claude. With neither, the line is not drawn, as before 0.5.
+
+#### When a worktree goes away
+
+At each refresh, a pinned or followed worktree whose folder is gone, or that git says is no
+longer a worktree, is dropped, and the pane goes back to the next in line: from pinned to
+followed, from followed to the session's. A folder left behind inside the main checkout
+(`.claude/worktrees/<name>` that a dev server writes to again) counts as gone, since git then
+answers for the main checkout. The place line then says
+`worktree removed — back to <name>` in the warning color, until the pane next follows or pins
+a worktree. The same goes for a Bash call that removes the followed worktree from the
+session's own folder (`cd <main> && git worktree remove <wt>`). A git command that only
+failed (a timeout) keeps the worktree where it is.
+
+#### Opening on its own
+
+With `autoOpen` set to `worktree` (the default) or `always`, the first time in a session that
+Claude is followed into a linked worktree (one made with `git worktree add`), the pane opens
+as it does when a session starts: only where it docks as a sidebar, and without taking the
+keyboard (see [Settings](#settings)). This happens once a session, the pane already being open
+included, and not at all once you have closed the pane in this session, with `q`,
+`/wt-diff close`, ctrl+x x or its close mark. `never` turns it off, and so does a
+non-interactive session.
 
 ### Keyboard
 
@@ -144,6 +278,7 @@ keyboard back to the prompt and leaves the pane open.
 | `l` | On a file, go to the diff. On a folded folder, unfold it; on an open folder, go to its first row | — |
 | `h` | Fold an open folder; on a file or a folded folder, go to the folder above it | Go back to the tree |
 | `w` | Go to the diff | Go back to the tree |
+| `o` | Open the [worktree list](#the-worktree-list) | Same |
 | `Enter` | Press the row the focus is on, as a click does: on the cursor's row, a file goes to the diff and a folder folds or unfolds | Go back to the tree |
 | `q` | Close the pane (ctrl+x x closes it too) | Same |
 | `a` / `c` / `u` | Switch the mode | Same |
@@ -189,13 +324,14 @@ is drawn as the diff region draws it. The keys are:
 | `l` | Unfold a folded folder or open a file's diff; on an open folder, go to its first row |
 | `g` / `e` | Go to the first / last row; `g` also scrolls the pane back to its top |
 | `x` | Close every open diff |
+| `o` | Open the [worktree list](#the-worktree-list) in the list's place |
 
 `q`, `a` / `c` / `u`, `r`, `t`, `z`, `Tab` and `Esc` do what they do in the tree above. A click
 on a file's name opens its diff and a second click closes it; a click on a folder row folds it.
 
 The pane scrolls as a whole, with the arrow keys and the wheel, when its content is taller than
 the pane. When the pane takes the keyboard, the focus starts on the row it was last on, or on
-the first row. While the pane has the keyboard it lists `j` `k` `h` `l` `g` `e` `q` at its
+the first row. While the pane has the keyboard it lists `j` `k` `h` `l` `g` `e` `q` `o` at its
 bottom, or under the buttons at the top when the listing is taller than the pane; there they
 show when the pane opens and scroll away with the rows, and `g` brings them back.
 
@@ -259,12 +395,15 @@ base with `/wt-diff base <ref>`.
 
 - After Claude's Edit, Write, MultiEdit, NotebookEdit, Bash, EnterWorktree and ExitWorktree
   tool calls (subagents' calls included), and at the end of every turn. Refreshes wait 300 ms
-  for a burst of edits to settle.
+  for a burst of edits to settle. A call that moves the pane to another worktree refreshes it
+  too.
 - Every few seconds while the pane is on screen, to catch edits made in your editor or another
   terminal. A tick that comes while the previous read is still running is skipped, so a slow
   repository is never read back to back. Untracked files whose size and modification time have
   not changed are not read again.
-- When you press refresh or switch modes.
+- When you press refresh or switch modes, and when you pin or unpin a worktree.
+
+Every refresh reads the worktree the pane shows.
 
 While the pane is closed, automatic refreshes are skipped unless the status line option is on.
 
@@ -278,7 +417,7 @@ Set these in the config menu (`/config`) or under `pluginConfigs` in settings:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `autoOpen` | `worktree` | `worktree`: open the pane when the session starts in, or enters, a linked worktree. `always`: in any git repository. `never`: only with `/wt-diff`. |
+| `autoOpen` | `worktree` | `worktree`: open the pane when the session starts in, or enters, a linked worktree, or the first time Claude is followed into one. `always`: in any git repository, and on that first follow too. `never`: only with `/wt-diff`. |
 | `pollSeconds` | `5` | How often the open pane re-reads git. `0` turns polling off. |
 | `statusLine` | `false` | Show the file count and line totals, such as `· 5 files +202 −34`, at the end of the hint line under the prompt. On a surface that does not draw that line, such as the desktop app, they appear in the status line instead; while the desktop app is attached, the terminal shows them in both places. |
 | `diffView` | `side` | `side`: the diff of the file under the cursor in a region of its own, beside the tree or, on a narrow pane, in its place. `inline`: a file's diff opens under its row in the list, as before version 0.4. |

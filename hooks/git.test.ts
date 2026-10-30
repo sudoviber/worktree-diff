@@ -263,22 +263,26 @@ describe('parsers', () => {
     expect(parseReflogCreatedFrom('')).toBeNull()
   })
 
-  test('worktree list --porcelain: branches, detached and bare', async () => {
+  test('worktree list --porcelain: branches, detached, bare and prunable', async () => {
     expect(parseWorktreeListPorcelain(PORCELAIN_ALL)).toEqual([
-      { path: REPO, head: MAIN_SHA, branch: 'main', isDetached: false, isBare: false },
+      { path: REPO, head: MAIN_SHA, branch: 'main', isDetached: false, isBare: false, isPrunable: false },
       {
         path: ROOT,
         head: 'e47b652208a1df9b8a3cbff954e65fc4b24fd4db',
         branch: 'feat',
         isDetached: false,
         isBare: false,
+        isPrunable: false,
       },
-      { path: '/w/t1-wt2', head: MAIN_SHA, branch: 'fromhead', isDetached: false, isBare: false },
-      { path: '/w/t1-wt3', head: MAIN_SHA, branch: null, isDetached: true, isBare: false },
+      { path: '/w/t1-wt2', head: MAIN_SHA, branch: 'fromhead', isDetached: false, isBare: false, isPrunable: false },
+      { path: '/w/t1-wt3', head: MAIN_SHA, branch: null, isDetached: true, isBare: false, isPrunable: false },
     ])
     expect(parseWorktreeListPorcelain('worktree /w/bare.git\nbare\n\n')).toEqual([
-      { path: '/w/bare.git', head: null, branch: null, isDetached: false, isBare: true },
+      { path: '/w/bare.git', head: null, branch: null, isDetached: false, isBare: true, isPrunable: false },
     ])
+    // Deleted without `git worktree remove`: still listed, with the reason (real git 2.4x).
+    const gone = `worktree /w/gone\nHEAD ${MAIN_SHA}\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n\n`
+    expect(parseWorktreeListPorcelain(gone)[0]?.isPrunable).toBe(true)
   })
 
   test('countLines counts a last line without a newline', async () => {

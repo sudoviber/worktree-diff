@@ -7,13 +7,18 @@ import type {
   RenderElement,
   RenderSurface,
   Timer,
+  ToolCallResult,
 } from 'claude-code'
 
-import type { DiffMode, FileChange, FileDiff, Snapshot, ViewMode } from '../types'
+import type { DiffMode, FileChange, FileDiff, Snapshot, ViewMode, WorktreeChoice, WorktreePicker } from '../types'
 import {
+  commonDirOf,
   computeSnapshot,
+  DIRS_ARGS,
   git,
+  isLinked,
   loadFileDiff,
+  parseWorktreeListPorcelain,
   repoDirs,
   shortRef,
   stableStartPoint,
@@ -43,6 +48,7 @@ import {
   type RowBudget,
 } from './layout'
 import { baseName, buildTree, dirPaths, isAllFolded, visibleRows, type Tree, type TreeDir, type TreeRow } from './tree'
+import { followPath, isFollowable, normalizePath, parentDir, pickTarget, resolvePath } from './follow'
 
 type Dollar = EngineInterface
 type Ui = Pick<Elements['terminal'], 'Box' | 'Text' | 'Button' | 'Code'>
@@ -68,8 +74,19 @@ const NAV_KEYS = [
   { hotkey: 'g', label: 'top' },
   { hotkey: 'e', label: 'end' },
   { hotkey: 'q', label: 'close' },
+  { hotkey: 'o', label: 'worktree' },
 ] as const
 type NavKey = (typeof NAV_KEYS)[number]['hotkey']
+/** The `o` list's keys, in both views: the same letters, each a Button of its own only while the list shows. */
+const PICK_KEYS = [
+  { hotkey: 'j', label: 'down' },
+  { hotkey: 'k', label: 'up' },
+  { hotkey: 'l', label: 'select' },
+  { hotkey: 'h', label: 'back' },
+  { hotkey: 'o', label: 'back' },
+  { hotkey: 'q', label: 'close' },
+] as const
+type PickKey = (typeof PICK_KEYS)[number]['hotkey']
 /**
  * diffView side: one Button per hotkey, each acting by the region the keys are
  * in. Half a page up is `b`: `u` stays the uncommitted tab. Drawn in this
@@ -87,6 +104,7 @@ const SIDE_KEYS: Record<Region, readonly { hotkey: SideKey; label: string }[]> =
     { hotkey: 'b', label: 'back' },
     { hotkey: 'g', label: 'top' },
     { hotkey: 'e', label: 'end' },
+    { hotkey: 'o', label: 'worktree' },
   ],
   diff: [
     { hotkey: 'j', label: 'down' },
@@ -100,9 +118,10 @@ const SIDE_KEYS: Record<Region, readonly { hotkey: SideKey; label: string }[]> =
     { hotkey: 'g', label: 'top' },
     { hotkey: 'e', label: 'end' },
     { hotkey: 'w', label: 'tree' },
+    { hotkey: 'o', label: 'worktree' },
   ],
 }
-export type SideKey = 'j' | 'k' | 'd' | 'b' | 'n' | 'p' | 'g' | 'e' | 'l' | 'h' | 'w' | 'q'
+export type SideKey = 'j' | 'k' | 'd' | 'b' | 'n' | 'p' | 'g' | 'e' | 'l' | 'h' | 'w' | 'q' | 'o'
 const isNavKey = (key: string) => key.startsWith('nav:')
 const isRowKey = (key: string) => key.startsWith('file:') || key.startsWith('dir:')
 // Compared by name: a build may not register every one of them.
@@ -115,13 +134,17 @@ const TRIGGER_TOOLS = new Set([
   'EnterWorktree',
   'ExitWorktree',
 ])
-const ARGUMENT_HINT = '[close | status | refresh | base [<ref>] | trunk [<ref>] | mode all|committed|uncommitted]'
+// They move the session itself: what Claude was followed into gives way.
+const MOVE_TOOLS = new Set(['EnterWorktree', 'ExitWorktree'])
+const ARGUMENT_HINT =
+  '[close | status | refresh | at [<path>] | base [<ref>] | trunk [<ref>] | mode all|committed|uncommitted]'
 export const USAGE = [
   `Usage: /wt-diff ${ARGUMENT_HINT}`,
   '  /wt-diff              open the Changes pane and give it the keyboard',
   '  /wt-diff close        close the Changes pane',
   '  /wt-diff status       print the changes as text',
   '  /wt-diff refresh      re-read git now',
+  '  /wt-diff at <path>    show the worktree at <path> instead of the one Claude works in; /wt-diff at follows again',
   '  /wt-diff base <ref>   compare this worktree against <ref>; /wt-diff base clears it',
   "  /wt-diff trunk <ref>  the repository's integration branch, for all its worktrees; /wt-diff trunk clears it",
   '  /wt-diff mode <mode>  all (default), committed or uncommitted',
@@ -147,6 +170,11 @@ const cursorAtom = atom({ plugin: 'worktree-diff', key: 'cursor' } as const, nul
 const regionAtom = atom({ plugin: 'worktree-diff', key: 'region' } as const, 'tree', { shape: 'region-1' })
 const diffOffsetAtom = atom({ plugin: 'worktree-diff', key: 'diffOffset' } as const, 0, { shape: 'offset-1' })
 const treeOffsetAtom = atom({ plugin: 'worktree-diff', key: 'treeOffset' } as const, 0, { shape: 'offset-1' })
+const pinnedAtom = atom({ plugin: 'worktree-diff', key: 'pinned' } as const, null, { shape: 'pinned-1' })
+const followedAtom = atom({ plugin: 'worktree-diff', key: 'followed' } as const, null, { shape: 'followed-1' })
+const fallbackAtom = atom({ plugin: 'worktree-diff', key: 'fallback' } as const, null, { shape: 'fallback-1' })
+const pickerAtom = atom({ plugin: 'worktree-diff', key: 'picker' } as const, null, { shape: 'picker-1' })
+const followOpensAtom = atom({ plugin: 'worktree-diff', key: 'followOpens' } as const, true, { shape: 'follow-opens-1' })
 
 // ----------------------------------------------------------------- config
 
@@ -353,6 +381,204 @@ const VIEW_KEY = 'view'
 
 export const isView = (value: unknown): value is ViewMode => value === 'tree' || value === 'list'
 
+// ----------------------------------------------------------------- target
+
+/** Where the pane's worktree comes from: a pin, Claude's last tool call, or the session itself. */
+type Level = 'pinned' | 'followed' | 'session'
+
+/** The directory the pane shows (pickTarget), where it comes from, and the session's own directory. */
+const targetNow = async ($: Dollar): Promise<{ path: string; level: Level; session: string }> => {
+  const [pinned, followed, session] = await Promise.all([read($, pinnedAtom), read($, followedAtom), $.session.cwd()])
+  const level: Level = pinned !== null ? 'pinned' : followed !== null ? 'followed' : 'session'
+
+  return { path: pickTarget(pinned, followed, session), level, session }
+}
+
+const sameDir = (a: string, b: string) => normalizePath(a) === normalizePath(b)
+
+const homeDir = async ($: Dollar): Promise<string> => {
+  try {
+    return (await $.env.get('HOME')) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+const isDir = async ($: Dollar, path: string): Promise<boolean> => {
+  try {
+    return (await $.fs.stat(path)).kind === 'dir'
+  } catch {
+    return false
+  }
+}
+
+/** `path`, or the nearest directory above it that exists; null when none does. */
+const nearestDir = async ($: Dollar, path: string): Promise<string | null> => {
+  let dir = path
+  while (!(await isDir($, dir))) {
+    if (dir === '/') return null
+    dir = parentDir(dir)
+  }
+
+  return dir
+}
+
+const removedNotice = (name: string) => `worktree removed — back to ${name}`
+
+/** The root of the worktree `dir` is in; null outside one. */
+const toplevel = async (deps: GitDeps, dir: string): Promise<string | null> => {
+  const top = await git(deps, dir, ['rev-parse', '--show-toplevel'])
+  const root = top.stdout.trim()
+
+  return top.exitCode === 0 && root !== '' ? root : null
+}
+
+/**
+ * Whether the worktree rooted at `root` is gone: its directory, or git's word
+ * that it is none (or, nested in another worktree, is that one); a git that
+ * only failed keeps it.
+ */
+const isGone = async ($: Dollar, deps: GitDeps, root: string): Promise<boolean> => {
+  if (!(await isDir($, root))) return true
+  const top = await git(deps, root, ['rev-parse', '--show-toplevel'])
+
+  return top.exitCode === 0 ? !sameDir(top.stdout.trim(), root) : /not a git repository/i.test(top.stderr)
+}
+
+/** The session directory's worktree and repository, kept while the session stays there. */
+let sessionRepo: { cwd: string; dirs: RepoDirs } | undefined
+
+/**
+ * The session directory's worktree and repository; null when git says it is
+ * in none, undefined when git failed to say (timed out, locked): no answer.
+ */
+const sessionDirs = async (deps: GitDeps, cwd: string): Promise<RepoDirs | null | undefined> => {
+  if (sessionRepo?.cwd === cwd) return sessionRepo.dirs
+  const top = await git(deps, cwd, ['rev-parse', '--show-toplevel'])
+  const root = top.stdout.trim()
+  if (top.exitCode !== 0 || root === '') return /not a git repository/i.test(top.stderr) ? null : undefined
+  const dirs = await git(deps, root, DIRS_ARGS)
+  const gitCommonDir = dirs.exitCode === 0 ? commonDirOf(dirs.stdout, root) : ''
+  if (gitCommonDir === '') return undefined
+  // Outside a repository is read again next time.
+  sessionRepo = { cwd, dirs: { root, gitCommonDir } }
+
+  return sessionRepo.dirs
+}
+
+/** Follows run one after another, in the order their calls ran: the last one's worktree stands. */
+let followChain: Promise<void> = Promise.resolve()
+
+const inFollow = (work: () => Promise<void>): Promise<void> => {
+  followChain = followChain.then(work).catch(() => undefined)
+
+  return followChain
+}
+
+/** A new worktree for the pane drops the last one's removal notice. */
+const setFollowed = async ($: Dollar, value: string | null) => {
+  if ((await read($, followedAtom)) !== value) await update($, followedAtom, () => value)
+  if ((await read($, fallbackAtom)) !== null) await update($, fallbackAtom, () => null)
+}
+
+const setPinned = async ($: Dollar, value: string | null) => {
+  if ((await read($, pinnedAtom)) !== value) await update($, pinnedAtom, () => value)
+  if ((await read($, fallbackAtom)) !== null) await update($, fallbackAtom, () => null)
+}
+
+/**
+ * Whether a Bash call that errored ran: core's error text says the exit code
+ * of a command that ran and failed. A call refused beneath the plugin (a
+ * hook, a rule, the person at the prompt) comes back errored with the reason alone.
+ */
+const hasRun = (ran: ToolCallResult): boolean =>
+  ran.deny === undefined && /\bExit code -?\d+\b/.test(ran.text ?? (typeof ran.result === 'string' ? ran.result : ''))
+
+/**
+ * After a tool call that ran: the worktree its path is in becomes the one
+ * the pane follows, if it is one of the session repository's (any, with the
+ * session outside one); the session's own worktree clears it. The first
+ * linked worktree followed opens the pane, unless the person closed it.
+ * A relative path is read from `start`, where the call ran (a subagent's own
+ * directory); `isExact` takes the path only where a directory stands.
+ */
+const follow = async ($: Dollar, tool: string, input: object, start: string, isExact: boolean) => {
+  const path = followPath(tool, input, start, await homeDir($))
+  if (path === null) return
+  const dir = isExact ? ((await isDir($, path)) ? path : null) : await nearestDir($, path)
+  if (dir === null) return
+  const deps = gitDeps($)
+  const root = await toplevel(deps, dir)
+  if (root === null) return
+  // The session's own, not the call's: a subagent's worktree is followed too.
+  const own = await sessionDirs(deps, await $.session.cwd())
+  // Without git's word on the session's repository, any could pass the filter.
+  if (own === undefined) return
+  const followed = await read($, followedAtom)
+  if (own !== null && sameDir(root, own.root)) {
+    if (followed === null) return
+    // `cd <main> && git worktree remove <wt>`: said here, as a refresh would have.
+    if (await isGone($, deps, followed)) {
+      await update($, followedAtom, () => null)
+      if ((await read($, pinnedAtom)) === null) await update($, fallbackAtom, () => removedNotice(baseName(own.root)))
+    } else {
+      await setFollowed($, null)
+    }
+    schedule($)
+    return
+  }
+  if (followed !== null && sameDir(root, followed)) return
+  const dirs = await git(deps, root, DIRS_ARGS)
+  if (dirs.exitCode !== 0 || !isFollowable(commonDirOf(dirs.stdout, root), own?.gitCommonDir ?? null)) return
+  await setFollowed($, root)
+  if (isLinked(dirs.stdout) && !isHeadless && config.autoOpen !== 'never' && (await read($, followOpensAtom))) {
+    await update($, followOpensAtom, () => false)
+    wantsAutoOpen = true
+  }
+  schedule($)
+}
+
+/**
+ * The snapshot of the worktree the pane shows. A pinned or followed one that
+ * is gone (removed, or no longer a worktree: git answers for another, as for
+ * a directory left inside the main checkout) gives way to the next in line,
+ * and `removed` says so; a git that only failed keeps it.
+ */
+const targetSnapshot = async (
+  $: Dollar,
+  deps: GitDeps,
+  mode: DiffMode,
+  previous: Snapshot | null,
+): Promise<{ snapshot: Snapshot; removed: boolean }> => {
+  let removed = false
+  for (;;) {
+    const { path, level } = await targetNow($)
+    if (level === 'session' || (await isDir($, path))) {
+      // A pinned or followed path is a worktree's root: a repository rooted elsewhere is not that worktree.
+      const isOwn = (snapshot: Snapshot) => level === 'session' || !snapshot.isRepo || sameDir(snapshot.root, path)
+      const dirs: RepoDirs | null =
+        previous !== null && previous.cwd === path && previous.isRepo && previous.gitCommonDir !== '' && isOwn(previous)
+          ? previous
+          : await repoDirs(deps, path)
+      const baseOverride = dirs === null ? null : await storedRef($, baseKey(dirs.root))
+      const trunk = dirs === null || dirs.gitCommonDir === '' ? null : await storedRef($, trunkKey(dirs.gitCommonDir))
+      const snapshot = await computeSnapshot(deps, { cwd: path, mode, baseOverride, trunk })
+      if (isOwn(snapshot) && (level === 'session' || snapshot.isRepo || snapshot.error !== undefined)) {
+        return { snapshot, removed }
+      }
+    }
+    // A follow may have moved it meanwhile: only this one goes.
+    const drop = (value: string | null) => (value === path ? null : value)
+    if (level === 'pinned') await update($, pinnedAtom, drop)
+    else await update($, followedAtom, drop)
+    removed = true
+  }
+}
+
+/** The `o` list's key for a choice; `auto` for none. */
+const pickKey = (choice: WorktreeChoice | undefined): string =>
+  choice === undefined ? 'pick:auto' : `pick:${oneLine(choice.path)}`
+
 // --------------------------------------------------------------- register
 
 type RefreshRequest = { force?: boolean; isVisible?: boolean }
@@ -368,6 +594,8 @@ let rerun = false
 let isForced = false
 let isVisible = false
 let wantsAutoOpen = false
+/** Whether session.start said no one watches: nothing would ever draw an open, so none is armed. */
+let isHeadless = false
 /** Whether the surface docks a pane beside the transcript; undefined until a drawing says. */
 let docksPanes: boolean | undefined
 /** Whether this load of the module has mirrored the stored view into state. */
@@ -389,8 +617,10 @@ let lastRowKey: string | undefined
 let rowMoves = 0
 /** The key presses still running, one after another: each reads where the last one left the ring. */
 let navChain: Promise<void> = Promise.resolve()
-/** diffView side: the regions as last drawn, for the wheel and for how far a key moves; lost on a reload until the next drawing. */
+/** diffView side: the regions on screen, for the wheel; none while the `o` list or a notice stands in their place, and lost on a reload until the next drawing. */
 let frame: Frame | undefined
+/** diffView side: the regions as last drawn, kept while the `o` list covers them: where the ring goes and how far a key moves. */
+let laid: Frame | undefined
 /** diffView side: the wait before the cursor's file is read, so keys held down read only where they stop. */
 let preview: Timer | undefined
 
@@ -563,23 +793,26 @@ const refreshOnce = async ($: Dollar, force: boolean): Promise<Snapshot | null> 
   if (!force && !isOpen && !config.statusLine && !wantsAutoOpen) return null
 
   const deps = gitDeps($)
-  const cwd = await $.session.cwd()
   const mode = await read($, modeAtom)
   const previous = await read($, snapshotAtom)
-  const dirs: RepoDirs | null =
-    previous !== null && previous.cwd === cwd && previous.isRepo && previous.gitCommonDir !== ''
-      ? previous
-      : await repoDirs(deps, cwd)
-  const baseOverride = dirs === null ? null : await storedRef($, baseKey(dirs.root))
-  const trunk = dirs === null || dirs.gitCommonDir === '' ? null : await storedRef($, trunkKey(dirs.gitCommonDir))
-  const snapshot = await computeSnapshot(deps, { cwd, mode, baseOverride, trunk })
+  const { snapshot, removed } = await targetSnapshot($, deps, mode, previous)
 
   if ((await read($, modeAtom)) !== mode) {
     // The mode moved while git ran: this result is the old mode's.
     rerun = true
     return snapshot
   }
+  // Another worktree: a diff read in the last one is not this one's, even under the same path.
+  // The session's cd within its worktree is the same one.
+  if (previous !== null && (previous.root || previous.cwd) !== (snapshot.root || snapshot.cwd)) {
+    await update($, diffsAtom, () => ({}))
+    await putDiffOffset($, 0)
+  }
   if (previous?.signature !== snapshot.signature) await update($, snapshotAtom, () => snapshot)
+  if (removed) {
+    const back = removedNotice(baseName(snapshot.root || snapshot.cwd))
+    await update($, fallbackAtom, () => back)
+  }
   // A failed read lists nothing: keep what is open until git answers again.
   if (snapshot.error === undefined || snapshot.files.length > 0) {
     if (config.diffView === 'side') {
@@ -593,8 +826,13 @@ const refreshOnce = async ($: Dollar, force: boolean): Promise<Snapshot | null> 
   if (config.statusLine) await showStatus($, snapshot)
   // Until a drawing says whether panes dock, the open stays pending.
   if (wantsAutoOpen && (isOpen || docksPanes !== undefined)) {
-    wantsAutoOpen = false
-    if (!isOpen && docksPanes === true && shouldAutoOpen(snapshot)) background(openPane($))
+    // A follow while git ran: this is the last worktree's snapshot, and the next pass decides.
+    if (!sameDir((await targetNow($)).path, snapshot.cwd)) {
+      rerun = true
+    } else {
+      wantsAutoOpen = false
+      if (!isOpen && docksPanes === true && shouldAutoOpen(snapshot)) background(openPane($))
+    }
   }
 
   return snapshot
@@ -715,7 +953,7 @@ const refProblem = async (deps: GitDeps, root: string, ref: string): Promise<str
 
 const setBase = async ($: Dollar, ref: string | undefined): Promise<string> => {
   const deps = gitDeps($)
-  const cwd = await $.session.cwd()
+  const { path: cwd } = await targetNow($)
   const dirs = await repoDirs(deps, cwd)
   if (dirs === null) return `Not a git repository: ${cwd}`
   const { root } = dirs
@@ -735,7 +973,7 @@ const setBase = async ($: Dollar, ref: string | undefined): Promise<string> => {
 
 const setTrunk = async ($: Dollar, ref: string | undefined): Promise<string> => {
   const deps = gitDeps($)
-  const cwd = await $.session.cwd()
+  const { path: cwd } = await targetNow($)
   const dirs = await repoDirs(deps, cwd)
   if (dirs === null) return `Not a git repository: ${cwd}`
   const { root, gitCommonDir } = dirs
@@ -802,7 +1040,7 @@ const ringOnFirstRows = async ($: Dollar, refreshed: Promise<Snapshot | null>) =
   const { rows } = await listingNow($)
   const key =
     config.diffView === 'side'
-      ? sideRing(frame?.layout, await read($, regionAtom), keptCursor([], rows, await read($, cursorAtom)))
+      ? sideRing(laid?.layout, await read($, regionAtom), keptCursor([], rows, await read($, cursorAtom)))
       : ringStart(rows.map(row => row.key))
   // Not yet drawn, the row is waited for.
   if (key !== undefined) await focusRow($, key)
@@ -828,12 +1066,122 @@ const focusPane = async ($: Dollar) => {
   return config.diffView === 'side' ? FOCUSED_SIDE : FOCUSED
 }
 
+/** The pane closed: the `o` list with it; closed by the person (q, the command, the close mark), never opened again for a follow. */
+const noteClosed = async ($: Dollar, isPerson: boolean) => {
+  if (isPerson && (await read($, followOpensAtom))) await update($, followOpensAtom, () => false)
+  if ((await read($, pickerAtom)) !== null) await update($, pickerAtom, () => null)
+}
+
 const closePane = async ($: Dollar) => {
   if ((await paneState($)) === undefined) return 'Changes pane is not open.'
   await $.ui.close({ id: PANE })
   stopPolling()
+  await noteClosed($, true)
 
   return 'Changes pane closed.'
+}
+
+/** `/wt-diff at <path>`: pins the worktree at `path`; no path follows Claude again. */
+const pinAt = async ($: Dollar, raw: string): Promise<string> => {
+  const arg = raw.replace(/^(['"])(.*)\1$/, '$2')
+  if (arg === '') {
+    await setPinned($, null)
+    await refresh($, { force: true, isVisible: true })
+    return 'Unpinned: following the worktree Claude works in.'
+  }
+  const path = resolvePath(arg, await $.session.cwd(), await homeDir($))
+  if (path === null) return `Not a path: ${arg}`
+  const root = (await isDir($, path)) ? await toplevel(gitDeps($), path) : null
+  if (root === null) return `Not a git worktree: ${path}`
+  await setPinned($, root)
+  await refresh($, { force: true, isVisible: true })
+
+  return `Showing ${baseName(root)} (pinned)`
+}
+
+/**
+ * Opens the `o` list: auto, then every worktree of the session's repository
+ * (the shown one's, with the session outside any), the cursor on the pin.
+ */
+const openPicker = async ($: Dollar) => {
+  const deps = gitDeps($)
+  const { path, session } = await targetNow($)
+  const args = ['worktree', 'list', '--porcelain']
+  let listed = await git(deps, session, args)
+  if (listed.exitCode !== 0 && path !== session) listed = await git(deps, path, args)
+  const choices: WorktreeChoice[] =
+    listed.exitCode !== 0
+      ? []
+      : parseWorktreeListPorcelain(listed.stdout)
+          .filter(entry => !entry.isBare && !entry.isPrunable)
+          .map(entry => ({ path: entry.path, branch: entry.branch, head: (entry.head ?? '').slice(0, 7) }))
+  const pinned = await read($, pinnedAtom)
+  const at = pinned === null ? 0 : choices.findIndex(choice => sameDir(choice.path, pinned)) + 1
+  await update($, pickerAtom, () => ({ at, choices }))
+  await focusRow($, pickKey(choices[at - 1]))
+}
+
+/** The ring back where the keys act once the list is gone: the cursor's row, or the row it last held. */
+const ringBack = async ($: Dollar) => {
+  if ((await paneState($))?.isFocused !== true) return
+  const { rows } = await listingNow($)
+  const key =
+    config.diffView === 'side'
+      ? sideRing(laid?.layout, await read($, regionAtom), keptCursor([], rows, await read($, cursorAtom)))
+      : ringStart(rows.map(row => row.key))
+  if (key !== undefined) await focusRow($, key)
+}
+
+const closePicker = async ($: Dollar) => {
+  await update($, pickerAtom, () => null)
+  await ringBack($)
+}
+
+/** A choice in the list: auto (null) follows Claude again, a worktree pins it. The next key waits for the list to close, not for git. */
+const choose = async ($: Dollar, path: string | null) => {
+  await update($, pickerAtom, () => null)
+  if ((await read($, pinnedAtom)) !== path) {
+    await setPinned($, path)
+    background(refresh($, { force: true, isVisible: true }))
+  }
+  await ringBack($)
+}
+
+/** A key while the list shows: j/k move, l picks, h and o go back, q closes the pane. */
+const pressPicker = async ($: Dollar, picker: WorktreePicker, key: PickKey) => {
+  if (key === 'q') {
+    await closePane($)
+    return
+  }
+  if (key === 'o' || key === 'h') {
+    await closePicker($)
+    return
+  }
+  if (key === 'l') {
+    await choose($, picker.choices[picker.at - 1]?.path ?? null)
+    return
+  }
+  const at = Math.max(0, Math.min(picker.choices.length, picker.at + (key === 'j' ? 1 : -1)))
+  if (at === picker.at) return
+  await update($, pickerAtom, now => (now === null ? null : { ...now, at }))
+  await focusRow($, pickKey(picker.choices[at - 1]))
+}
+
+const isPickKey = (key: string): key is PickKey => PICK_KEYS.some(one => one.hotkey === key)
+
+/**
+ * The keys' one Button each, by mode: while the list shows, its own; `o`
+ * opens it. True when the press was the list's.
+ */
+const pressedPicker = async ($: Dollar, key: string): Promise<boolean> => {
+  const picker = await read($, pickerAtom)
+  if (picker !== null) {
+    if (isPickKey(key)) await pressPicker($, picker, key)
+    return true
+  }
+  if (key !== 'o') return false
+  await openPicker($)
+  return true
 }
 
 /** Keeps where the ring is; a press of a key's own Button leaves the row it acts from. */
@@ -893,7 +1241,7 @@ const parentRow = (rows: readonly NavRow[], at: number): NavRow | undefined => {
 export const navAction = (
   rows: readonly NavRow[],
   focused: string | undefined,
-  key: Exclude<NavKey, 'q'>,
+  key: Exclude<NavKey, 'q' | 'o'>,
   isOpen: (row: NavRow) => boolean,
 ): NavAction => {
   const at = focused === undefined ? -1 : rows.findIndex(row => row.key === focused)
@@ -918,8 +1266,9 @@ export const navAction = (
   return parent === undefined ? null : { focus: parent.key }
 }
 
-/** A key Button's press: q closes the pane; the rest do what navAction says. */
+/** A key Button's press: the list's while it shows, o opens it, q closes the pane; the rest do what navAction says. */
 const pressNav = async ($: Dollar, key: NavKey) => {
+  if ((await pressedPicker($, key)) || key === 'o') return
   if (key === 'q') {
     await closePane($)
     return
@@ -1138,11 +1487,18 @@ const settleCursor = async ($: Dollar, before?: { rows: readonly NavRow[]; total
   }
   const at = rows.findIndex(row => row.key === key)
   const offset = await read($, treeOffsetAtom)
-  const height = frame?.treeRows ?? FALLBACK_ROWS
+  const height = laid?.treeRows ?? FALLBACK_ROWS
   const was = before !== undefined && key === cursor ? before.rows.findIndex(row => row.key === key) : -1
   await putTreeOffset($, refreshedTreeWindow(offset, was, before?.total ?? 0, at, total, height))
   // The ring's row is gone or hidden: left alone, the engine puts it elsewhere and Enter presses that.
-  if (key !== cursor && sideRing(frame?.layout, await read($, regionAtom), key) === key) await focusRow($, key)
+  // While the `o` list shows the ring is on it, and the rows are not drawn.
+  if (
+    key !== cursor &&
+    sideRing(laid?.layout, await read($, regionAtom), key) === key &&
+    (await read($, pickerAtom)) === null
+  ) {
+    await focusRow($, key)
+  }
 }
 
 /**
@@ -1179,14 +1535,14 @@ const cursorTo = async ($: Dollar, rows: readonly NavRow[], total: number, key: 
     previewSoon($)
   }
   const offset = await read($, treeOffsetAtom)
-  await putTreeOffset($, treeWindow(offset, at, total, frame?.treeRows ?? FALLBACK_ROWS))
+  await putTreeOffset($, treeWindow(offset, at, total, laid?.treeRows ?? FALLBACK_ROWS))
   if (isRing) await focusRow($, key)
 }
 
 /** The keys act on the diff; with the diff alone shown, the ring waits on h's Button. */
 const toDiff = async ($: Dollar) => {
   await putRegion($, 'diff')
-  const ring = sideRing(frame?.layout, 'diff', null)
+  const ring = sideRing(laid?.layout, 'diff', null)
   if (ring !== undefined) await focusRow($, ring)
 }
 
@@ -1222,6 +1578,7 @@ const DIFF_MOVES: Partial<Record<SideKey, DiffMove>> = {
  * the same letters scroll it, n/p by hunk, h and w go back to the tree.
  */
 const pressSide = async ($: Dollar, key: SideKey) => {
+  if (await pressedPicker($, key)) return
   if (key === 'q') {
     await closePane($)
     return
@@ -1231,14 +1588,14 @@ const pressSide = async ($: Dollar, key: SideKey) => {
     const move = DIFF_MOVES[key]
     if (move !== undefined) {
       const { total, hunkStarts } = bodyRows(now.body)
-      const rows = frame?.diffRows ?? FALLBACK_ROWS
+      const rows = laid?.diffRows ?? FALLBACK_ROWS
       await putDiffOffset($, moveDiff(await read($, diffOffsetAtom), move, { total, rows, hunkStarts }))
     } else if (key === 'h' || key === 'w') await toTree($, now.row)
     return
   }
   const move = CURSOR_MOVES[key]
   if (move !== undefined) {
-    const to = now.rows[moveCursor(now.at, move, now.rows.length, frame?.treeRows ?? FALLBACK_ROWS)]
+    const to = now.rows[moveCursor(now.at, move, now.rows.length, laid?.treeRows ?? FALLBACK_ROWS)]
     if (to !== undefined) await cursorTo($, now.rows, now.total, to.key, true)
     return
   }
@@ -1296,8 +1653,15 @@ const runCommand = async ($: Dollar, args: string): Promise<string> => {
       return rest.length > 0 ? USAGE : closePane($)
     case 'status': {
       const snapshot = await refresh($, { force: true })
-      return snapshot ? summaryText(snapshot) : 'Could not read git.'
+      if (!snapshot) return 'Could not read git.'
+      // Says which worktree when it is not the session's own.
+      const [pinned, followed] = await Promise.all([read($, pinnedAtom), read($, followedAtom)])
+      const kind = snapshot.cwd === pinned ? 'pinned' : snapshot.cwd === followed ? 'auto' : null
+      return `${kind === null ? '' : `⌂ ${snapshot.cwd} · ${kind}\n`}${summaryText(snapshot)}`
     }
+    case 'at':
+      // A path may hold blanks: the rest of the line as typed.
+      return pinAt($, args.trim().slice(sub.length).trim())
     case 'refresh': {
       const snapshot = await refresh($, { force: true, isVisible: true })
       return snapshot ? `Refreshed: ${summaryText(snapshot).split('\n')[0]}` : 'Could not read git.'
@@ -1343,6 +1707,7 @@ export const register: Register = (on, options) => {
     // State outlives a reload: a snapshot already there means this is one,
     // and a pane the person closed stays closed.
     const isReload = (await read($, snapshotAtom)) !== null
+    isHeadless = !e.isInteractive
     wantsAutoOpen = e.isInteractive && !isReload && config.autoOpen !== 'never'
     // A reload that cut a visible pass short never cleared its marker.
     if (await read($, refreshingAtom)) await update($, refreshingAtom, () => false)
@@ -1381,15 +1746,26 @@ export const register: Register = (on, options) => {
     }
   })
 
+  // Main loop and subagents alike: a call that ran says where Claude works.
   on('tool.call', async ($, e, next) => {
-    const isEnter = String(e.tool) === 'EnterWorktree' && config.autoOpen !== 'never'
-    const before = isEnter ? await $.session.cwd() : ''
+    const tool = String(e.tool)
+    const isMove = MOVE_TOOLS.has(tool)
+    // Read in the hook: the call's own directory (a subagent's), as it started.
+    const before = TRIGGER_TOOLS.has(tool) ? await $.session.cwd() : ''
     const ran = await next(e)
     try {
-      if (TRIGGER_TOOLS.has(String(e.tool))) {
-        // Only a move that happened: a denied or failed call leaves a closed pane closed.
-        if (isEnter && ran.deny === undefined && ran.isError !== true && (await $.session.cwd()) !== before) {
-          wantsAutoOpen = true
+      if (TRIGGER_TOOLS.has(tool)) {
+        // Only what happened: a denied or failed call moves nothing and leaves a closed pane closed.
+        const isDone = ran.deny === undefined && ran.isError !== true
+        if (isDone && isMove) {
+          if ((await $.session.cwd()) !== before) {
+            if (tool === 'EnterWorktree' && !isHeadless && config.autoOpen !== 'never') wantsAutoOpen = true
+            background(inFollow(() => setFollowed($, null)))
+          }
+        } else if (!isMove && (isDone || (tool === 'Bash' && hasRun(ran)))) {
+          // A failed Bash still ran its leading cd (`cd wt && npm test` with a test failing),
+          // when the directory is there. git runs after the result is handed back.
+          background(inFollow(() => follow($, tool, e, before, !isDone)))
         }
         schedule($)
       }
@@ -1412,7 +1788,10 @@ export const register: Register = (on, options) => {
 
   on('ui.close', async ($, e, next) => {
     const closed = await next(e)
-    if (e.id === PANE) stopPolling()
+    if (e.id === PANE) {
+      stopPolling()
+      background(noteClosed($, e.origin?.kind === 'person'))
+    }
 
     return closed
   }).catch(($, e, next) => next(e))
@@ -1465,24 +1844,32 @@ export const register: Register = (on, options) => {
     learnLayout($, e.viewport?.isFullscreen)
     startPolling($)
     const isSide = config.diffView === 'side'
-    const [snapshot, mode, expanded, diffs, isRefreshing, view, collapsedDirs, side] = await Promise.all([
-      read($, snapshotAtom),
-      read($, modeAtom),
-      read($, expandedAtom),
-      read($, diffsAtom),
-      read($, refreshingAtom),
-      read($, viewAtom),
-      read($, collapsedAtom),
-      isSide ? readSide($) : undefined,
-    ])
+    const [snapshot, mode, expanded, diffs, isRefreshing, view, collapsedDirs, side, pinned, followed, fallback, picker] =
+      await Promise.all([
+        read($, snapshotAtom),
+        read($, modeAtom),
+        read($, expandedAtom),
+        read($, diffsAtom),
+        read($, refreshingAtom),
+        read($, viewAtom),
+        read($, collapsedAtom),
+        isSide ? readSide($) : undefined,
+        read($, pinnedAtom),
+        read($, followedAtom),
+        read($, fallbackAtom),
+        read($, pickerAtom),
+      ])
     const tree = view === 'tree' && snapshot?.isRepo === true ? buildTree(snapshot.files) : null
     const rows = listedRows(snapshot, tree, collapsedDirs)
     const columns = Math.max(16, e.props.bodyColumns)
-    // The side view's ring starts on the cursor's row, or on h's while the diff alone shows.
+    // The ring starts on the list's cursor while it shows; the side view's on the cursor's row, or on h's while the diff alone shows.
     const autoFocus =
-      side === undefined
-        ? ringStart(rows.map(row => navRow(row).key))
-        : sideRing(paneLayout(columns), side.region, keptCursor([], rows.map(navRow), side.cursor))
+      picker !== null
+        ? pickKey(picker.choices[picker.at - 1])
+        : side === undefined
+          ? ringStart(rows.map(row => navRow(row).key))
+          : sideRing(paneLayout(columns), side.region, keptCursor([], rows.map(navRow), side.cursor))
+    const place = pinned ?? followed
     let drawn: Frame | undefined
 
     const pane = drawPane(ui, {
@@ -1490,6 +1877,9 @@ export const register: Register = (on, options) => {
       tree,
       rows,
       autoFocus,
+      place: place === null ? null : { name: baseName(place), kind: pinned !== null ? 'pinned' : 'auto' },
+      fallback,
+      picker: picker === null ? null : { ...picker, pinned, shown: snapshot?.isRepo === true ? snapshot.root : null },
       isFocused: e.props.isFocused,
       bodyRows: e.props.scroll.bodyRows,
       mode,
@@ -1513,12 +1903,14 @@ export const register: Register = (on, options) => {
       onNav: key => background(inTurn(() => pressNav($, key))),
       onSide: key => background(inTurn(() => pressSide($, key))),
       onRow: key => background(inTurn(() => pressRow($, key))),
+      onPick: path => background(inTurn(() => choose($, path))),
       onFrame: regions => {
         drawn = regions
       },
     })
-    // A drawing without the regions (reading git, a notice) leaves none for the wheel to move.
+    // A drawing without the regions (reading git, a notice, the `o` list) leaves none for the wheel to move.
     if (isSide) frame = drawn
+    if (drawn !== undefined) laid = drawn
 
     return pane
   })
@@ -1536,6 +1928,12 @@ type PaneModel = {
   rows: readonly ListRow[]
   /** The row Button the ring starts on when the pane takes the keyboard. */
   autoFocus: string | undefined
+  /** The worktree shown when not the session's own: its name, and whether pinned or followed. */
+  place: { name: string; kind: 'auto' | 'pinned' } | null
+  /** `worktree removed — back to <name>`, in the place line's stead. */
+  fallback: string | null
+  /** The `o` list while it shows, with the pin it ticks and the worktree on show it dots. */
+  picker: (WorktreePicker & { pinned: string | null; shown: string | null }) | null
   isFocused: boolean
   /** The rows the pane's window shows at once. */
   bodyRows: number
@@ -1561,6 +1959,8 @@ type PaneModel = {
   onSide: (key: SideKey) => void
   /** A row pressed in the side view, by its key. */
   onRow: (key: string) => void
+  /** A row of the `o` list pressed: a worktree's path, or null for auto. */
+  onPick: (path: string | null) => void
   /** Told the regions' geometry as drawn, for the keys and the wheel. */
   onFrame: (frame: Frame) => void
 }
@@ -1595,10 +1995,14 @@ const ESC_HINT = 'esc: back'
 const KEYS_SPARE_ROWS = 2
 const FOCUS_HINT = 'ctrl+x tab to focus'
 
+/** The inline view's keys: the `o` list's while it shows. */
+const navKeys = (model: PaneModel): readonly { hotkey: NavKey; label: string }[] =>
+  model.picker !== null ? PICK_KEYS : NAV_KEYS
+
 /** Rows drawKeys takes, its margin included; 0 where it draws nothing. */
 const keysRows = (model: PaneModel): number => {
   if (model.isFocused) {
-    const widths = [...NAV_KEYS.map(({ hotkey, label }) => plainCells(hotkey, label)), ESC_HINT.length]
+    const widths = [...navKeys(model).map(({ hotkey, label }) => plainCells(hotkey, label)), ESC_HINT.length]
     return wrappedRows(widths, 2, model.columns) + 1
   }
   return model.surface === 'terminal' ? textRows(FOCUS_HINT, model.columns) + 1 : 0
@@ -1617,7 +2021,7 @@ const drawKeys = (ui: Ui, model: PaneModel, isTop: boolean): RenderElement | nul
   if (model.isFocused) {
     return (
       <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={isTop ? 0 : 1} marginBottom={isTop ? 1 : 0}>
-        {NAV_KEYS.map(({ hotkey, label }) => (
+        {navKeys(model).map(({ hotkey, label }) => (
           <Button key={`nav:${hotkey}`} label={label} hotkey={hotkey} plain dimColor onPress={() => model.onNav(hotkey)} />
         ))}
         <Text dimColor>{ESC_HINT}</Text>
@@ -1638,13 +2042,35 @@ const autoFocusOn = (model: PaneModel, key: string): { autoFocus?: true } =>
   model.autoFocus === key ? { autoFocus: true } : {}
 
 /**
- * Two rows: the branch with ↑↓ at the right edge, then what it is compared
- * against with where that came from. Each part is cut to fit beforehand, so
- * the right side keeps its place.
+ * One dim row above the branch while the pane shows another worktree than
+ * the session's: `⌂ <name> · auto` (followed) or `· pinned`; in its stead,
+ * once one was removed, where the pane went back to.
+ */
+const drawPlace = (ui: Ui, model: PaneModel): RenderElement | null => {
+  const { Text } = ui
+  if (model.fallback !== null) {
+    return (
+      <Text color="warning" wrap="truncate-end">
+        {clip(oneLine(model.fallback), model.columns)}
+      </Text>
+    )
+  }
+  if (model.place === null) return null
+  const tail = ` · ${model.place.kind}`
+  const name = fitPath(oneLine(model.place.name), Math.max(1, model.columns - 2 - tail.length))
+
+  return <Text dimColor wrap="truncate-end">{`⌂ ${name}${tail}`}</Text>
+}
+
+/**
+ * Two rows, three under the place line: the branch with ↑↓ at the right
+ * edge, then what it is compared against with where that came from. Each
+ * part is cut to fit beforehand, so the right side keeps its place.
  */
 const drawHeader = (ui: Ui, model: PaneModel, snapshot: Snapshot): RenderElement[] => {
   const { Box, Text } = ui
   const { columns } = model
+  const place = drawPlace(ui, model)
   const branch = oneLine(snapshot.branch ?? `detached ${snapshot.head}`.trim())
   const base = snapshot.head === '' ? null : snapshot.base
   const { ahead, behind } = snapshot
@@ -1661,6 +2087,7 @@ const drawHeader = (ui: Ui, model: PaneModel, snapshot: Snapshot): RenderElement
   }
   const marksCells = base === null ? 1 : 2 + cellWidth(`↑${ahead} ↓${behind}`)
   const rows = [
+    ...(place !== null ? [place] : []),
     <Box flexDirection="row" justifyContent="space-between">
       <Text weight="semibold" wrap="truncate-end">
         {fitPath(branch, Math.max(1, columns - marksCells - 2))}
@@ -2237,6 +2664,61 @@ const drawDiff = (
   return shown(nodes, chars, nodes.length)
 }
 
+/** Cells before a list row's name: the cursor's mark, then the pin's tick or the shown worktree's dot. */
+const PICK_LEAD = 4
+
+/**
+ * The `o` list's rows `from` on, at most `count`, in `cells`: auto, then each
+ * worktree's directory name, branch (or short sha) and path, dim, the path
+ * giving way first. The cursor's row is marked, the pin ticked (auto when
+ * none), the worktree on show dotted when not ticked; each name a Button, a
+ * press picks it.
+ */
+const drawPickRows = (
+  ui: Ui,
+  model: PaneModel,
+  picker: NonNullable<PaneModel['picker']>,
+  cells: number,
+  from: number,
+  count: number,
+): RenderElement[] => {
+  const { Box, Button, Text } = ui
+  const out: RenderElement[] = []
+  for (let index = from; index < Math.min(picker.choices.length + 1, from + count); index++) {
+    const choice = picker.choices[index - 1]
+    const key = pickKey(choice)
+    const isCursor = index === picker.at
+    const isPinned = choice === undefined ? picker.pinned === null : picker.pinned !== null && sameDir(choice.path, picker.pinned)
+    const isShown = choice !== undefined && picker.shown !== null && sameDir(choice.path, picker.shown)
+    const room = Math.max(1, cells - PICK_LEAD)
+    const name = fitPath(oneLine(choice === undefined ? 'auto' : baseName(choice.path)), room)
+    const detail = oneLine(choice === undefined ? 'follow Claude' : (choice.branch ?? choice.head))
+    let left = room - cellWidth(name)
+    const branch = left >= 2 + NAME_MIN ? `  ${fitPath(detail, left - 2)}` : ''
+    left -= cellWidth(branch)
+    const path = choice !== undefined && left >= 2 + NAME_MIN * 2 ? `  ${fitPath(oneLine(choice.path), left - 2)}` : ''
+    out.push(
+      <Box key={`row:${key}`} flexDirection="row">
+        {isCursor ? <Text color="suggestion">{'› '}</Text> : <Text>{'  '}</Text>}
+        {isPinned ? (
+          <Text color="success">{'✓ '}</Text>
+        ) : isShown ? (
+          <Text dimColor>{'• '}</Text>
+        ) : (
+          <Text>{'  '}</Text>
+        )}
+        <Button key={key} plain onPress={() => model.onPick(choice?.path ?? null)} {...autoFocusOn(model, key)}>
+          {isCursor ? <Text weight="semibold">{name}</Text> : name}
+        </Button>
+        {branch !== '' ? <Text dimColor={choice === undefined}>{branch}</Text> : null}
+        {path !== '' ? <Text dimColor>{path}</Text> : null}
+      </Box>,
+    )
+  }
+
+  return out
+}
+
 /** Whether rows are listed: no notice, or a failed read that kept what it listed before. */
 const isListedOf = (snapshot: Snapshot, notice: Notice | null): boolean =>
   notice === null || (Boolean(snapshot.error) && snapshot.head !== '' && snapshot.files.length > 0)
@@ -2254,10 +2736,16 @@ export const drawPane = (ui: Ui, model: PaneModel): RenderElement => {
   const { Box, Text } = ui
   const { snapshot, tree } = model
 
+  // The `o` list under a screen with no listing, so its keys never act on rows unseen.
+  const picked = model.picker === null ? null : drawPickRows(ui, model, model.picker, model.columns, 0, Infinity)
+  const pickedBlock = picked === null ? null : <Box flexDirection="column" marginTop={1}>{picked}</Box>
+
   if (snapshot === null) {
     return (
       <Box flexDirection="column">
+        {drawPlace(ui, model)}
         <Text dimColor>Reading git…</Text>
+        {pickedBlock}
         {drawKeys(ui, model, false)}
       </Box>
     )
@@ -2265,6 +2753,7 @@ export const drawPane = (ui: Ui, model: PaneModel): RenderElement => {
   if (!snapshot.isRepo) {
     return (
       <Box flexDirection="column">
+        {drawPlace(ui, model)}
         {snapshot.error ? (
           <Text color="error">{`Error: ${oneLine(snapshot.error)}`}</Text>
         ) : (
@@ -2273,6 +2762,7 @@ export const drawPane = (ui: Ui, model: PaneModel): RenderElement => {
         <Text dimColor wrap="truncate-middle">
           {oneLine(snapshot.cwd)}
         </Text>
+        {pickedBlock}
         {drawKeys(ui, model, false)}
       </Box>
     )
@@ -2314,6 +2804,13 @@ export const drawPane = (ui: Ui, model: PaneModel): RenderElement => {
     }
 
     return <Box flexDirection="column">{body}</Box>
+  }
+
+  // The `o` list in the listing's place.
+  if (picked !== null && pickedBlock !== null) {
+    body.push(pickedBlock)
+    height += picked.length + 1
+    return finish()
   }
 
   const notice = noticeOf(snapshot)
@@ -2389,10 +2886,11 @@ const sideHintRows = (model: PaneModel): number => (model.isFocused || model.sur
 const drawSideKeys = (ui: Ui, model: PaneModel, side: SideState, isClipped: boolean): RenderElement => {
   const { Box, Button } = ui
   const clip = isClipped ? { height: 1, overflow: 'hidden' as const } : {}
+  const keys: readonly { hotkey: SideKey; label: string }[] = model.picker !== null ? PICK_KEYS : SIDE_KEYS[side.region]
 
   return (
     <Box flexDirection="row" flexWrap="wrap" columnGap={2} {...clip}>
-      {SIDE_KEYS[side.region].map(({ hotkey, label }) => (
+      {keys.map(({ hotkey, label }) => (
         <Button
           key={`nav:${hotkey}`}
           label={label}
@@ -2673,6 +3171,26 @@ const drawRegions = (ui: Ui, model: PaneModel, side: SideState, snapshot: Snapsh
   )
 }
 
+/** The `o` list in the regions' place, as tall: its head, then the window of rows with the cursor in it. */
+const drawPickRegion = (
+  ui: Ui,
+  model: PaneModel,
+  picker: NonNullable<PaneModel['picker']>,
+  budget: RowBudget,
+): RenderElement => {
+  const { Box, Text } = ui
+  const from = treeWindow(0, picker.at, picker.choices.length + 1, budget.content)
+
+  return (
+    <Box flexDirection="column" height={budget.region} overflow="hidden">
+      <Text color="suggestion" weight="semibold">
+        {' worktrees '}
+      </Text>
+      {drawPickRows(ui, model, picker, model.columns, from, budget.content)}
+    </Box>
+  )
+}
+
 /**
  * The side view: v0.3's header, actions, tabs and summary on top, the
  * regions under them, the keys on the last row. As tall as the body exactly,
@@ -2709,7 +3227,9 @@ const drawSide = (ui: Ui, model: PaneModel, side: SideState, snapshot: Snapshot)
       <Box flexDirection="column" height={budget.top} overflow="hidden">
         {top}
       </Box>
-      {isListed || notice === null ? (
+      {model.picker !== null ? (
+        drawPickRegion(ui, model, model.picker, budget)
+      ) : isListed || notice === null ? (
         drawRegions(ui, model, side, snapshot, budget)
       ) : (
         <Box flexDirection="column" height={budget.region} overflow="hidden">

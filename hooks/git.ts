@@ -201,6 +201,8 @@ export type WorktreeEntry = {
   branch: string | null
   isDetached: boolean
   isBare: boolean
+  /** Listed but gone: its directory was deleted without `git worktree remove`. */
+  isPrunable: boolean
 }
 
 export const parseWorktreeListPorcelain = (out: string): WorktreeEntry[] => {
@@ -214,6 +216,7 @@ export const parseWorktreeListPorcelain = (out: string): WorktreeEntry[] => {
         branch: null,
         isDetached: false,
         isBare: false,
+        isPrunable: false,
       }
       entries.push(current)
     } else if (current === null) {
@@ -226,6 +229,8 @@ export const parseWorktreeListPorcelain = (out: string): WorktreeEntry[] => {
       current.isDetached = true
     } else if (line === 'bare') {
       current.isBare = true
+    } else if (line === 'prunable' || line.startsWith('prunable ')) {
+      current.isPrunable = true
     }
   }
 
@@ -777,7 +782,7 @@ export const commonDirOf = (stdout: string, root: string): string => {
   return normalizePath(dir.startsWith('/') ? dir : joinPath(root, dir))
 }
 
-const DIRS_ARGS = ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'] as const
+export const DIRS_ARGS = ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'] as const
 
 export type RepoDirs = { root: string; gitCommonDir: string }
 

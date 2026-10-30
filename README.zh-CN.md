@@ -2,7 +2,9 @@
 
 [English](README.md) | 简体中文
 
-一个 Claude Code mod：在对话旁边停靠一个 **Changes** 面板，显示当前 git worktree 相对于它的来源分支改了什么。左边是一棵文件树，列出每个文件的增删行数；右边是一个独立的区域，显示光标所在文件的 diff。Claude 改完文件或执行命令后，面板会自动刷新，不用切到别的工具就能跟上分支上的改动。
+一个 Claude Code mod：在对话旁边停靠一个 **Changes** 面板，显示一个 git worktree 相对于它的来源分支改了什么。左边是一棵文件树，列出每个文件的增删行数；右边是一个独立的区域，显示光标所在文件的 diff。Claude 改完文件或执行命令后，面板会自动刷新，不用切到别的工具就能跟上分支上的改动。
+
+面板显示的是 Claude 正在工作的那个 worktree：即使 session 本身停在主 checkout，Claude 用绝对路径或 `cd <worktree> && …` 去改另一个 worktree，面板也会跟过去。你也可以自己固定显示某个 worktree。详见[显示哪个 worktree](#显示哪个-worktree)。
 
 ```
 feat/login                                                                       ↑3 ↓1
@@ -24,7 +26,7 @@ a: all   c: committed   u: uncommitted
 j: down  k: up  l: open  w: diff  h: fold  q: close  d: page  b: back  g: top  e: end
 ```
 
-头部第一行是分支名，以及它领先 base 多少个提交（↑）、落后多少个（↓）。第二行是对比的 base 分支。操作按钮下面是模式标签，标签下的横线标出当前模式，再下一行是当前模式下的文件数和增删行数合计。
+头部第一行是分支名，以及它领先 base 多少个提交（↑）、落后多少个（↓）。第二行是对比的 base 分支。面板显示的不是 session 自己的 worktree 时，分支名上方还会多一行，写出显示的是哪个 worktree（见[位置行](#位置行)）。操作按钮下面是模式标签，标签下的横线标出当前模式，再下一行是当前模式下的文件数和增删行数合计。
 
 文件默认按目录树显示。一串只含一个子目录的目录会合并成一行（如 `src/app/api/`）。折叠起来的目录会显示里面有几个文件，以及下面所有改动的行数合计。改名的文件放在新路径下，`←` 后面是旧文件名；如果是从别的目录移过来的，则显示旧路径。平铺列表视图里始终显示旧路径。`●` 表示这个文件还有没提交的改动。面板较窄时，过长的名字会从中间省略。
 
@@ -84,9 +86,11 @@ claude plugin update worktree-diff
 |---|---|
 | `/wt-diff` | 打开面板并把键盘交给它（面板被别的面板的 tab 挡住时会被提到前面） |
 | `/wt-diff close` | 关闭面板 |
-| `/wt-diff status` | 刷新后以纯文本输出改动 |
+| `/wt-diff status` | 刷新后以纯文本输出面板所显示 worktree 的改动 |
 | `/wt-diff refresh` | 立即重新读取 git |
-| `/wt-diff base <ref>` | 此后把这个 worktree 和 `<ref>` 对比（跨 session 保留） |
+| `/wt-diff at <path>` | 改为显示 `<path>` 所在的 worktree，不再跟随 Claude（固定） |
+| `/wt-diff at` | 取消固定，重新跟随 Claude 正在工作的 worktree |
+| `/wt-diff base <ref>` | 此后把面板所显示的 worktree 和 `<ref>` 对比（跨 session 保留） |
 | `/wt-diff base` | 清除上面的设置，回到自动推断的 base |
 | `/wt-diff trunk <ref>` | 指定仓库的集成分支（如 `origin/feat/auth-ui`），仓库里所有 worktree 共用，跨 session 保留 |
 | `/wt-diff trunk` | 清除集成分支设置 |
@@ -94,7 +98,80 @@ claude plugin update worktree-diff
 
 Claude 还在工作时，`/wt-diff` 也会立即执行，所以可以边打开面板边看改动陆续出现。
 
-`/wt-diff status` 始终输出平铺列表。
+`/wt-diff status` 始终输出平铺列表。面板显示的不是 session 自己的 worktree 时，第一行是 `⌂ <路径> · auto` 或 `⌂ <路径> · pinned`。
+
+### 显示哪个 worktree
+
+面板一次只显示一个 worktree，按下面的顺序取第一个有的：
+
+1. **pinned（固定）**：你用 `/wt-diff at <path>` 或 `o` 列表选定的 worktree。
+2. **followed（跟随）**：Claude 最近工作的那个 worktree（session 自己的 worktree 除外）。
+3. **session 自己的**：session 工作目录所在的 worktree。
+
+固定和跟随都只在当前 session 里有效：执行 `/reload-plugins` 后仍然保留，新开的 session 两者都没有。面板的一切操作都作用于它显示的 worktree：刷新和轮询、`/wt-diff status`、`/wt-diff base` 和 `/wt-diff trunk`。`/wt-diff base` 设置的 base 属于单个 worktree，trunk 属于整个仓库，所以每个 worktree 都用自己的设置对比。
+
+#### 跟随 Claude
+
+Claude 每次调用工具成功之后（没有被拒绝，也没有出错；子 agent 的调用也算），面板会看这次调用指向哪里：
+
+- **Edit**、**Write**、**MultiEdit**：`file_path` 所在的目录。**NotebookEdit**：`notebook_path` 所在的目录。文件所在的目录还不存在时，从往上最近一个存在的目录算起。
+- **Bash**：命令开头那几个 `cd`（或 `pushd`）最终落到的目录。`cd ../app-login && npm test` 跟随 `../app-login`；`cd /code/app && cd wt; make` 跟随 `/code/app/wt`：每个 `cd` 接着上一个的位置走，第一个从这次调用开始时所在的目录算起。支持引号、`~` 和 `--`。开头的 `cd` 里只要有一个没法确定去向，整条命令就不算：变量、`$(…)`、反引号、通配符或花括号、重定向、管道、`||`、`&`、`cd -`，或者带了多个参数。跟在别的命令后面的 `cd`（`npm test && cd wt`）不算，也不查 `CDPATH`。如果 Bash 在 `cd` 之后失败了（比如 `cd wt && npm test` 里测试没通过，结果里带有退出码），只要落到的目录确实存在，照样跟随。还没运行就被拒绝的调用（你拒绝了它，或者被 hook、权限规则拒绝）不跟随。
+- 其他工具（Read、Grep 等）：不跟随。
+
+这个目录会换成它所在 worktree 的根目录（`git rev-parse --show-toplevel`），而且只有和 session 属于同一个仓库（是它的一个 worktree，共用同一个 git 目录）时才会跟随。所以 Claude 往 `~/.claude` 下写 memory，或者改别的仓库里的文件时，面板不会跳走。session 不在任何 git 仓库里时，哪个仓库的 worktree 都可以跟随。如果 git 没能判断出 session 在哪个仓库（比如超时），这次调用就不跟随。
+
+Claude 回到 session 自己的 worktree 里工作时，停止跟随。EnterWorktree 和 ExitWorktree 会移动 session 本身，所以它们一旦改变了 session 的目录，跟随的 worktree 就会清掉，面板改为显示 session 新的 worktree。跟随所需的 git 命令在工具结果交还给 Claude 之后才执行，并且按调用顺序一个接一个地跑，所以以最后一次调用的 worktree 为准。
+
+#### 固定
+
+- `/wt-diff at <path>` 固定显示 `<path>` 所在的 worktree。这一行余下的部分都算路径，可以带空格，外面套的一对引号会去掉；相对路径从 session 的目录算起，`~` 指你的 home 目录。任何 git worktree 都能固定，不管是不是同一个仓库。成功时回复 `Showing <name> (pinned)`；不能显示时回复 `Not a path: …` 或 `Not a git worktree: …`。
+- `/wt-diff at` 后面什么都不写：取消固定，面板重新跟随 Claude。
+- 在面板里按 `o`：打开 worktree 列表。
+
+固定的优先级高于跟随，所以 Claude 去别的 worktree 工作时，面板仍然停在固定的那个上。
+
+#### worktree 列表
+
+按 `o` 打开的列表，第一项是 `auto`，后面是 session 所在仓库的全部 worktree（session 不在任何仓库里时，取面板所显示 worktree 的仓库），顺序和 `git worktree list` 一致。裸仓库，以及没有用 `git worktree remove`、而是直接删掉目录的 worktree，不会列出来。在 side 视图里，列表占据两个区域的位置，顶上有一个 ` worktrees ` 栏头；在行内视图里，列表占据文件列表的位置。
+
+```
+ worktrees
+› ✓ auto  follow Claude
+  • app-login  feat/login  /code/app-login
+    app  main  /code/app
+    app-fix  3f2a9c1  /code/app-fix
+```
+
+每一行依次是光标 `›`、一个标记、worktree 的目录名、分支（`HEAD` 处于 detached 状态时显示短 commit）和暗色的路径。面板窄的时候先省掉路径，再省掉分支。`✓` 标出当前生效的选择：没有固定时是 `auto`，固定时是固定的那个 worktree。面板正在显示、但没有 `✓` 的那个 worktree，会标一个暗色的 `•`。光标一开始停在 `✓` 那一行。
+
+| 键 | 作用 |
+|---|---|
+| `j` / `k` | 光标下移 / 上移 |
+| `l` 或 `Enter` | 选中这一行：选 `auto` 取消固定，选某个 worktree 就固定它 |
+| `h` 或 `o` | 关闭列表，不做任何改变 |
+| `q` | 关闭面板 |
+
+用鼠标点某一行也会选中它。列表打开时，最底部一行列出它的按键（`j: down  k: up  l: select  h: back  o: back  q: close`）。列表关闭后，按键回到原来作用的地方。
+
+#### 位置行
+
+面板显示的不是 session 自己的 worktree 时，分支名上方会多一行暗色文字写出它的名字，跟随的标 `auto`，固定的标 `pinned`：
+
+```
+⌂ app-login · auto
+feat/login                                                                       ↑3 ↓1
+vs main                                                               reflog · a1b2c3d
+```
+
+固定到 session 自己的 worktree 时也会显示这一行（`⌂ app · pinned`），让你知道面板不会再跟随 Claude。既没有固定也没有跟随时不显示这一行，和 0.5 版以前一样。
+
+#### worktree 被删除后
+
+每次刷新时，如果固定或跟随的 worktree 目录已经不在了，或者 git 说它已经不是 worktree 了，就把它清掉，退回下一级：固定的退到跟随的，跟随的退到 session 自己的。留在主 checkout 里面的目录（比如 dev server 又往里写文件的 `.claude/worktrees/<name>`）也算已删除，因为这时 git 回答的是主 checkout。这时位置行会用警告色显示 `worktree removed — back to <name>`，直到面板下一次跟随或固定某个 worktree。从 session 自己的目录删除正在跟随的 worktree（`cd <main> && git worktree remove <wt>`）时也一样。如果只是 git 命令失败了（比如超时），worktree 保持不变。
+
+#### 自动打开
+
+`autoOpen` 为 `worktree`（默认）或 `always` 时，Claude 在一个 session 里第一次被跟随进 linked worktree（用 `git worktree add` 建的）时，面板会像 session 启动时那样自动打开：只在会作为侧边栏停靠的布局下打开，也不会抢走键盘（见[设置](#设置)）。每个 session 只有这一次机会（面板本来就开着也算用掉了）；你在这个 session 里关过面板之后（按 `q`、执行 `/wt-diff close`、按 ctrl+x x 或点关闭标记），就不会再自动打开。设为 `never`，或者 session 不是交互式的，都不会自动打开。
 
 ### 键盘操作
 
@@ -109,6 +186,7 @@ Claude 还在工作时，`/wt-diff` 也会立即执行，所以可以边打开�
 | `l` | 在文件上：进入 diff 区。在已折叠的目录上：展开它；在已展开的目录上：跳到它的第一行 | — |
 | `h` | 折叠已展开的目录；在文件或已折叠的目录上时，跳到上一级目录 | 回到文件树 |
 | `w` | 进入 diff 区 | 回到文件树 |
+| `o` | 打开 [worktree 列表](#worktree-列表) | 同左 |
 | `Enter` | 按下焦点所在的行，和鼠标点击一样：在光标所在行上时，文件进入 diff 区，目录折叠或展开 | 回到文件树 |
 | `q` | 关闭面板（ctrl+x x 也可以） | 同左 |
 | `a` / `c` / `u` | 切换模式 | 同左 |
@@ -141,10 +219,11 @@ Claude 还在工作时，`/wt-diff` 也会立即执行，所以可以边打开�
 | `l` | 展开已折叠的目录，或打开文件的 diff；在已展开的目录上时，跳到它的第一行 |
 | `g` / `e` | 跳到第一行 / 最后一行；`g` 同时把面板滚回顶部 |
 | `x` | 关闭所有已打开的 diff |
+| `o` | 在文件列表的位置打开 [worktree 列表](#worktree-列表) |
 
 `q`、`a` / `c` / `u`、`r`、`t`、`z`、`Tab`、`Esc` 的作用和上面文件树里一样。点文件名打开它的 diff，再点一次关闭；点目录行把它折叠。
 
-内容超过面板高度时，整个面板一起滚动，用方向键或滚轮都可以。面板拿到键盘时，焦点落在上次停留的那一行，没有的话落在第一行。面板拿着键盘时，底部会列出 `j` `k` `h` `l` `g` `e` `q`。如果列表比面板还高，这一行改放在顶部按钮下面：面板打开时可以看到，随列表滚动会滚走，按 `g` 就能回来。
+内容超过面板高度时，整个面板一起滚动，用方向键或滚轮都可以。面板拿到键盘时，焦点落在上次停留的那一行，没有的话落在第一行。面板拿着键盘时，底部会列出 `j` `k` `h` `l` `g` `e` `q` `o`。如果列表比面板还高，这一行改放在顶部按钮下面：面板打开时可以看到，随列表滚动会滚走，按 `g` 就能回来。
 
 ### 模式
 
@@ -181,9 +260,11 @@ Claude 还在工作时，`/wt-diff` 也会立即执行，所以可以边打开�
 
 ### 什么时候刷新
 
-- Claude 每次调用 Edit、Write、MultiEdit、NotebookEdit、Bash、EnterWorktree、ExitWorktree 之后（包括子 agent 的调用），以及每一轮结束时。刷新会等 300 毫秒，让连续的编辑先落定。
+- Claude 每次调用 Edit、Write、MultiEdit、NotebookEdit、Bash、EnterWorktree、ExitWorktree 之后（包括子 agent 的调用），以及每一轮结束时。刷新会等 300 毫秒，让连续的编辑先落定。某次调用让面板换到另一个 worktree 时，也会刷新。
 - 面板显示在屏幕上时，每隔几秒刷新一次，用来发现你在编辑器或别的终端里做的修改。如果上一次读取还没结束，这一次就跳过，所以即使仓库很慢，也不会接连不断地读 git。大小和修改时间都没变的未跟踪文件不会重复读取。
-- 按下刷新或切换模式时。
+- 按下刷新或切换模式时，以及固定或取消固定 worktree 时。
+
+每次刷新读取的都是面板所显示的 worktree。
 
 面板关闭时，除非打开了状态栏选项，否则不做自动刷新。
 
@@ -195,7 +276,7 @@ Claude 还在工作时，`/wt-diff` 也会立即执行，所以可以边打开�
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|
-| `autoOpen` | `worktree` | `worktree`：session 在 linked worktree 里启动或进入 linked worktree 时打开面板。`always`：在任何 git 仓库里都打开。`never`：只在执行 `/wt-diff` 时打开。 |
+| `autoOpen` | `worktree` | `worktree`：session 在 linked worktree 里启动、进入 linked worktree，或者 Claude 第一次被跟随进 linked worktree 时打开面板。`always`：在任何 git 仓库里都打开，第一次跟随时也打开。`never`：只在执行 `/wt-diff` 时打开。 |
 | `pollSeconds` | `5` | 面板打开时重新读取 git 的间隔（秒）。`0` 关闭轮询。 |
 | `statusLine` | `false` | 在输入框下方提示行的末尾显示文件数和增删行数合计，如 `· 5 files +202 −34`。在不画这一行的界面上（比如桌面应用），改为显示在状态栏里；桌面应用连着时，终端会在两处都显示。 |
 | `diffView` | `side` | `side`：光标所在文件的 diff 显示在单独的区域里，在文件树旁边；面板窄时与文件树轮流显示。`inline`：文件的 diff 在列表里该文件行的下方展开，和 0.4 版以前一样。 |
