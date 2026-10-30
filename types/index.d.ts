@@ -33,7 +33,7 @@ export type BaseInfo = {
 }
 
 export type Snapshot = {
-  /** The session directory the snapshot was computed for. */
+  /** The directory the snapshot was computed for: the worktree the pane shows, or the session's directory. */
   cwd: string
   isRepo: boolean
   /** A git failure worth showing; the rest of the snapshot is best effort. */
@@ -71,6 +71,21 @@ export type FileDiff = {
   error?: string
 }
 
+/** A worktree the `o` list offers, as `git worktree list` gives it. */
+export type WorktreeChoice = {
+  path: string
+  /** Short branch name, null when detached. */
+  branch: string | null
+  /** Short sha of its HEAD. */
+  head: string
+}
+
+export type WorktreePicker = {
+  /** The row the cursor is on: 0 is `auto`, then the worktrees in order. */
+  at: number
+  choices: WorktreeChoice[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'worktree-diff': {
@@ -91,6 +106,16 @@ declare module 'claude-code' {
       diffOffset: Shaped<number>
       /** diffView side: the first row of the listing the tree region shows. */
       treeOffset: Shaped<number>
+      /** The worktree root the person pinned the pane to (`/wt-diff at`, `o`); null follows Claude. */
+      pinned: Shaped<string | null>
+      /** The worktree root Claude last worked in, when not the session's own; null shows the session's. */
+      followed: Shaped<string | null>
+      /** `worktree removed — back to <name>`, shown until the pane's worktree changes again. */
+      fallback: Shaped<string | null>
+      /** The `o` list of worktrees; null while closed. */
+      picker: Shaped<WorktreePicker | null>
+      /** Whether following Claude into a linked worktree may still open the pane: once, and never after the person closed it. */
+      followOpens: Shaped<boolean>
     }
   }
 }

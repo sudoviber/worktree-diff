@@ -126,6 +126,10 @@ const keyOf = (argv: readonly string[]) => {
 
 type World = {
   table?: Record<string, Answer>
+  /** Answers that differ by the directory git runs in, over `table`. */
+  byCwd?: Record<string, Record<string, Answer>>
+  /** Directories `$.fs.stat` finds. */
+  dirs?: readonly string[]
   files?: Record<string, string>
   /** Paths `$.fs.stat` calls symbolic links. */
   links?: readonly string[]
@@ -154,6 +158,8 @@ const gate = () => {
 const world = (on: On, given: World = {}) => {
   const state = {
     table: given.table ?? featTable(),
+    byCwd: given.byCwd ?? {},
+    dirs: new Set(given.dirs ?? [REPO, ROOT]),
     files: given.files ?? featFiles,
     cwd: given.cwd ?? ROOT,
     isOpen: given.isOpen ?? true,
@@ -199,7 +205,7 @@ const world = (on: On, given: World = {}) => {
       state.onHold()
       await state.hold
     }
-    const answer = state.table[key] ?? fail(128, `fatal: unmocked: ${key}\n`)
+    const answer = state.byCwd[e.init?.cwd ?? '']?.[key] ?? state.table[key] ?? fail(128, `fatal: unmocked: ${key}\n`)
 
     return {
       value: {
@@ -218,6 +224,7 @@ const world = (on: On, given: World = {}) => {
     return { value: text }
   })
   on('fs.stat', (_, e) => {
+    if (state.dirs.has(e.path)) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false } }
     const text = state.files[e.path]
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
     const isLink = given.links?.includes(e.path) ?? false
@@ -2089,6 +2096,7 @@ describe('keyboard', () => {
         ['g', 'top'],
         ['e', 'end'],
         ['q', 'close'],
+        ['o', 'worktree'],
       ])
       for (const button of nav) expect(button.props).toMatchObject({ plain: true, dimColor: true })
       expect((await ui.find({ type: 'Text', text: 'esc: back' }))?.props).toMatchObject({ dimColor: true })
@@ -2103,7 +2111,7 @@ describe('keyboard', () => {
         expect((await screen(ui, 60)).slice(-3).map(line => line.trimEnd())).toEqual([
           '',
           'j: down  k: up  h: fold  l: open  g: top  e: end  q: close',
-          'esc: back',
+          'o: worktree  esc: back',
         ])
       }
       await ui.unmount()
@@ -2119,7 +2127,7 @@ describe('keyboard', () => {
         // Everything fits in 40 rows: the keys come last.
         const roomy = await $.ui.mount({ ...PANE, props, surface })
         let drawn = order(await roomy.drawn())
-        if (isFocused) expect(drawn.slice(-7)).toEqual(['nav:j', 'nav:k', 'nav:h', 'nav:l', 'nav:g', 'nav:e', 'nav:q'])
+        if (isFocused) expect(drawn.slice(-8)).toEqual(['nav:j', 'nav:k', 'nav:h', 'nav:l', 'nav:g', 'nav:e', 'nav:q', 'nav:o'])
         if (!isFocused && surface === 'terminal') {
           expect((await screen(roomy, 60)).at(-1)?.trimEnd()).toBe('ctrl+x tab to focus')
         }
@@ -2129,7 +2137,7 @@ describe('keyboard', () => {
         drawn = order(await tight.drawn())
         if (isFocused) {
           const at = drawn.indexOf('nav:j')
-          expect(drawn.slice(at - 1, at + 8)).toEqual(['fold', 'nav:j', 'nav:k', 'nav:h', 'nav:l', 'nav:g', 'nav:e', 'nav:q', 'mode:all'])
+          expect(drawn.slice(at - 1, at + 9)).toEqual(['fold', 'nav:j', 'nav:k', 'nav:h', 'nav:l', 'nav:g', 'nav:e', 'nav:q', 'nav:o', 'mode:all'])
         }
         if (surface === 'terminal') {
           const lines = (await screen(tight, 60)).map(line => line.trimEnd())
@@ -2137,7 +2145,7 @@ describe('keyboard', () => {
           expect(lines[2]).toBe('r: refresh  t: list  z: fold')
           expect(lines.slice(3, 6)).toEqual(
             isFocused
-              ? ['j: down  k: up  h: fold  l: open  g: top  e: end  q: close', 'esc: back', '']
+              ? ['j: down  k: up  h: fold  l: open  g: top  e: end  q: close', 'o: worktree  esc: back', '']
               : ['ctrl+x tab to focus', '', 'a: all   c: committed   u: uncommitted'],
           )
         }
@@ -2682,7 +2690,8 @@ describe('refresh', () => {
     expect(ran).toEqual({ result: {} })
     await $.tool.call({ tool: 'Write', file_path: `${ROOT}/b.txt`, content: 'x' })
     await clock.advance(299)
-    expect(state.calls).toEqual([])
+    // Only what it follows is read meanwhile: the session's own worktree.
+    expect(state.calls.filter(key => key === PASS_MARK)).toEqual([])
     await clock.advance(1)
     const passes = state.calls.filter(key => key === PASS_MARK)
     expect(passes.length).toBe(1)
@@ -3397,10 +3406,10 @@ describe('side view', () => {
       const ui = await $.ui.mount({ ...sidePane(120), surface })
       let columns = 120
       const last = async () => (await screen(ui, columns)).at(-1)?.trimEnd()
-      if (surface === 'terminal') expect(await last()).toBe('j: down  k: up  l: open  w: diff  h: fold  q: close  d: page  b: back  g: top  e: end')
+      if (surface === 'terminal') expect(await last()).toBe('j: down  k: up  l: open  w: diff  h: fold  q: close  d: page  b: back  g: top  e: end  o: worktree')
       await keys(ui, 'w')
       if (surface === 'terminal') {
-        expect(await last()).toBe('j: down  k: up  d: page  b: back  n: next  p: prev  h: tree  q: close  g: top  e: end  w: tree')
+        expect(await last()).toBe('j: down  k: up  d: page  b: back  n: next  p: prev  h: tree  q: close  g: top  e: end  w: tree  o: worktree')
       }
       // One row: what does not fit is cut, still pressed by its letter.
       await ui.redraw(sidePane(70).props)
@@ -3668,6 +3677,28 @@ describe('side view', () => {
     await ui.unmount()
   })
 
+  sideTest('a cd within the worktree keeps the diff where it was: the same worktree, read from below its root', async ($, on) => {
+    const { state, clock } = world(on, {
+      table: sideTable({ [`diff -M ${MB} -- :(literal)a.txt`]: ok(LONG_A) }),
+      files: treeFiles,
+      dirs: [REPO, ROOT, `${ROOT}/src`],
+    })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...sidePane(120), surface: 'terminal' })
+    await ui.press({ key: 'file:keep.txt' })
+    await ui.press({ key: 'file:a.txt' })
+    await clock.advance(120)
+    await keys(ui, 'wn')
+    const first = async () => (await regionLines(ui, 'diff', 73))?.[0]
+    expect(await first()).toBe('@@ 40  fn40()')
+    // As `cd src && bun test` leaves the session.
+    state.cwd = `${ROOT}/src`
+    await wtDiff($, 'refresh')
+    await clock.advance(120)
+    expect(await first()).toBe('@@ 40  fn40()')
+    await ui.unmount()
+  })
+
   sideTest('side by side, a blank cell sits on each side of the rule', async ($, on) => {
     const { clock } = world(on, { table: sideTable(), files: treeFiles })
     await wtDiff($, 'refresh')
@@ -3725,6 +3756,26 @@ describe('side view', () => {
     }
   })
 
+  sideTest('a refresh under the o list keeps the tree’s window as drawn: the list hides the regions, not their size', async ($, on) => {
+    const { state } = world(on, { table: sideTable(), files: treeFiles })
+    await wtDiff($, 'refresh')
+    // 5 rows of the tree show; the cursor on the last.
+    const ui = await $.ui.mount({ ...sidePane(120, 14), surface: 'terminal' })
+    const treeTop = async () => (await regionLines(ui, 'tree', 46))?.[0]
+    await keys(ui, 'e')
+    const top = await treeTop()
+    expect(top).toBeDefined()
+    for (const back of ['h', 'o'] as const) {
+      await keys(ui, 'o')
+      expect(await regionLines(ui, 'tree', 46)).toBeUndefined()
+      state.table = sideTable({ [`diff --numstat -z -M ${MB} --`]: ok(NUMSTAT_ALL.replace('1\t0\tkeep.txt', `${back === 'h' ? 2 : 3}\t0\tkeep.txt`)) })
+      await wtDiff($, 'refresh')
+      await keys(ui, back)
+      expect(await treeTop()).toBe(top)
+    }
+    await ui.unmount()
+  })
+
   test('keptCursor stays, gives way below then above, goes to what hides it, else to the first row', async () => {
     const row = (key: string, depth = 0): NavRow => ({
       key,
@@ -3743,5 +3794,532 @@ describe('side view', () => {
     expect(keptCursor([], all.slice(0, 2).concat(all.slice(3)), 'file:src/lib/x.ts')).toBe('dir:src/lib')
     expect(keptCursor([], [all[0] as NavRow, all[4] as NavRow], 'file:src/lib/x.ts')).toBe('dir:src')
     expect(keptCursor([], [all[4] as NavRow], 'file:src/lib/x.ts')).toBe('file:z.ts')
+  })
+})
+
+// ---------------------------------------------------------------- follow
+
+// The session sits in the main checkout; Claude works in the feat worktree (ROOT) or a sibling (WT2).
+const WT2 = '/w/t1-wt2'
+const OTHER = '/x/other'
+const HOME = '/home/me'
+const DIRS_KEY = 'rev-parse --path-format=absolute --git-dir --git-common-dir'
+
+const mainAnswers: Record<string, Answer> = {
+  'rev-parse --show-toplevel': ok(`${REPO}\n`),
+  [DIRS_KEY]: ok(`${REPO}/.git\n${REPO}/.git\n`),
+  'symbolic-ref --short -q HEAD': ok('main\n'),
+  'rev-parse --verify --quiet --short HEAD': ok('1dfc5da\n'),
+}
+const wt2Answers: Record<string, Answer> = {
+  'rev-parse --show-toplevel': ok(`${WT2}\n`),
+  [DIRS_KEY]: ok(`${REPO}/.git/worktrees/t1-wt2\n${REPO}/.git\n`),
+  'symbolic-ref --short -q HEAD': ok('fromhead\n'),
+  'reflog show --format=%gs refs/heads/fromhead': ok('branch: Created from HEAD\n'),
+  'rev-parse --abbrev-ref fromhead@{upstream}': fail(128, "fatal: no upstream configured for branch 'fromhead'\n"),
+}
+
+/** The main checkout's session, its sibling worktrees, another repository and a home that is none. */
+const followWorld = (on: On, given: World = {}) => {
+  mock.env(on, { HOME })
+  return world(on, {
+    cwd: REPO,
+    dirs: [REPO, ROOT, WT2, OTHER, `${HOME}/.claude`],
+    ...given,
+    byCwd: {
+      [REPO]: mainAnswers,
+      [WT2]: wt2Answers,
+      [OTHER]: { 'rev-parse --show-toplevel': ok(`${OTHER}\n`), [DIRS_KEY]: ok(`${OTHER}/.git\n${OTHER}/.git\n`) },
+      [`${HOME}/.claude`]: { 'rev-parse --show-toplevel': NOT_A_REPO },
+      ...given.byCwd,
+    },
+  })
+}
+
+/** A tool call's follow, then the refresh it schedules, landed. */
+const landed = async (clock: { settle: () => Promise<unknown>; advance: (ms: number) => Promise<unknown> }) => {
+  await clock.settle()
+  await clock.advance(300)
+  await clock.settle()
+}
+
+/** The first line `/wt-diff status` answers: `⌂ <root> · auto|pinned` when the pane shows another worktree. */
+const shown = async ($: Engine) => ((await wtDiff($, 'status')).text ?? '').split('\n')[0]
+
+const editIn = ($: Engine, path: string, agentId?: string) =>
+  $.tool.call({ tool: 'Edit', file_path: path, old_string: 'a', new_string: 'b', ...(agentId !== undefined ? { agentId } : {}) })
+
+describe('follow', () => {
+  test('an Edit by absolute path in another worktree moves the pane there, ⌂ above the branch, on terminal and desktop', async ($, on) => {
+    const { clock } = followWorld(on)
+    expect(await shown($)).toMatch(/^main/)
+    await editIn($, `${ROOT}/src/new.ts`)
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      const lines = await screen(ui, 60)
+      expect(lines[0]?.trimEnd()).toBe('⌂ t1-wt · auto')
+      expect(lines[1]).toMatch(/^feat/)
+      expect((await ui.find({ type: 'Text', text: '⌂ t1-wt · auto' }))?.props.dimColor).toBe(true)
+      for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(60)
+      await ui.unmount()
+    }
+    // Narrow, the name is cut, never the line past the pane.
+    await editIn($, `${WT2}/x`)
+    await landed(clock)
+    const narrow = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 16 } })
+    expect((await screen(narrow, 16))[0]?.trimEnd()).toBe('⌂ t1-wt2 · auto')
+    await narrow.unmount()
+  })
+
+  sideTest('the side view grows its top by the ⌂ row and still fills the body exactly', async ($, on) => {
+    const { clock } = followWorld(on, { table: sideTable(), files: treeFiles })
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    for (const surface of SURFACES) {
+      for (const columns of [70, 120]) {
+        for (const bodyRows of [12, 24]) {
+          const ui = await $.ui.mount({ ...sidePane(columns, bodyRows), surface })
+          const lines = await screen(ui, columns)
+          expect(lines).toHaveLength(bodyRows)
+          expect(lines[0]?.trimEnd()).toBe('⌂ t1-wt · auto')
+          expect(lines[1]).toMatch(/^feat/)
+          for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(columns)
+          await ui.unmount()
+        }
+      }
+    }
+  })
+
+  test('a Bash cd chain moves it too, a relative one from the session; a subagent’s call counts', async ($, on) => {
+    const { clock } = followWorld(on)
+    await $.tool.call({ tool: 'Bash', command: 'cd ../t1-wt2 && npm test', agentId: 'a1' })
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${WT2} · auto`)
+    await $.tool.call({ tool: 'Bash', command: `cd ${ROOT}; git status` })
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+    // Not at the start, or not to be read for sure: nothing moves.
+    for (const command of ['npm test && cd ../t1-wt2', 'cd $WT && ls', `cd ${WT2} | cat`]) {
+      await $.tool.call({ tool: 'Bash', command })
+      await landed(clock)
+      expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+    }
+  })
+
+  test('work outside the session’s repository, a call that failed or was denied, or a Read moves nothing', async ($, on) => {
+    // Beneath the plugin, ahead of the world's answer.
+    on('tool.call', { tool: 'Write' }, (_, e, next) => (String(e.file_path).includes('denied') ? { deny: 'no' } : next(e)))
+    on('tool.call', { tool: 'NotebookEdit' }, () => ({ result: {}, isError: true }))
+    const { clock } = followWorld(on)
+    await editIn($, `${HOME}/.claude/projects/memory/notes.md`)
+    await editIn($, `${OTHER}/src/a.ts`)
+    await $.tool.call({ tool: 'Write', file_path: `${ROOT}/denied.txt`, content: 'x' })
+    await $.tool.call({ tool: 'NotebookEdit', notebook_path: `${ROOT}/n.ipynb`, new_source: 'x' } as never)
+    await $.tool.call({ tool: 'Read', file_path: `${ROOT}/a.txt` })
+    await landed(clock)
+    expect(await shown($)).toMatch(/^main/)
+
+    // A MultiEdit that ran moves it; back in the session's own worktree it shows that again.
+    await $.tool.call({ tool: 'MultiEdit', file_path: `${ROOT}/a.txt`, edits: [] } as never)
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+    await editIn($, `${REPO}/README.md`)
+    await landed(clock)
+    expect(await shown($)).toMatch(/^main/)
+  })
+
+  test('a NotebookEdit that ran moves it by its notebook_path', async ($, on) => {
+    const { clock } = followWorld(on)
+    await $.tool.call({ tool: 'NotebookEdit', notebook_path: `${WT2}/n.ipynb`, new_source: 'x' } as never)
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${WT2} · auto`)
+  })
+
+  test('a failed Bash follows its cd where the directory stands: the cd ran, a later command failed', async ($, on) => {
+    // As core says it: the command's output, then its exit code.
+    const failed = { result: 'Exit code 1\nFAIL a.test.ts', text: 'Exit code 1\nFAIL a.test.ts', isError: true as const }
+    // Refused beneath the plugin (a hook, a rule, the person at the prompt): errored with the reason alone, nothing ran.
+    const refused = { result: 'Error: The user rejected this call', text: 'The user rejected this call', isError: true as const }
+    on('tool.call', { tool: 'Bash' }, (_, e) => {
+      const command = String(e.command)
+      return command.includes('deny') ? { deny: 'no' } : command.includes('rm -rf') ? refused : failed
+    })
+    const { clock } = followWorld(on)
+    await $.tool.call({ tool: 'Bash', command: `cd ${WT2} && rm -rf dist` })
+    await landed(clock)
+    expect(await shown($)).toMatch(/^main/)
+    // A directory that is not there: the cd itself failed, nothing above it is taken.
+    await $.tool.call({ tool: 'Bash', command: `cd ${WT2}/gone && npm test` })
+    await landed(clock)
+    expect(await shown($)).toMatch(/^main/)
+    await $.tool.call({ tool: 'Bash', command: `cd ${WT2} && deny` })
+    await landed(clock)
+    expect(await shown($)).toMatch(/^main/)
+    await $.tool.call({ tool: 'Bash', command: `cd ${WT2} && npm test` })
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${WT2} · auto`)
+  })
+
+  test('a relative cd reads from where the call started, though the session moved meanwhile', async ($, on) => {
+    // As a foreground cd would, beneath the plugin: the session's directory is elsewhere once the call is done.
+    let move = () => {}
+    on('tool.call', { tool: 'Bash' }, () => {
+      move()
+      return { result: {} }
+    })
+    const { state, clock } = followWorld(on, { byCwd: { [HOME]: { 'rev-parse --show-toplevel': NOT_A_REPO } } })
+    move = () => {
+      state.cwd = HOME
+    }
+    await $.tool.call({ tool: 'Bash', command: 'cd ../t1-wt2 && make' })
+    await landed(clock)
+    expect(state.cwd).toBe(HOME)
+    expect(await shown($)).toBe(`⌂ ${WT2} · auto`)
+  })
+
+  test('a git that fails on the session’s repository follows nothing: it may be another one', async ($, on) => {
+    // A directory of its own: what an earlier read of the repository's kept does not answer for it.
+    const sub = `${REPO}/fails`
+    const timedOut = fail(1, 'error: timed out\n')
+    const { state, clock } = followWorld(on, { cwd: sub, dirs: [sub, REPO, ROOT, OTHER] })
+    state.byCwd[sub] = { 'rev-parse --show-toplevel': timedOut }
+    await editIn($, `${OTHER}/src/a.ts`)
+    await landed(clock)
+    expect(await shown($)).not.toMatch(/^⌂/)
+    // Its common dir unread too.
+    state.byCwd[sub] = { 'rev-parse --show-toplevel': ok(`${REPO}\n`) }
+    state.byCwd[REPO] = { ...mainAnswers, [DIRS_KEY]: timedOut }
+    await editIn($, `${OTHER}/src/a.ts`)
+    await landed(clock)
+    expect(await shown($)).not.toMatch(/^⌂/)
+    // Answered, the filter holds: another repository is not followed, a sibling is.
+    state.byCwd[REPO] = mainAnswers
+    await editIn($, `${OTHER}/src/a.ts`)
+    await landed(clock)
+    expect(await shown($)).toMatch(/^main/)
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+  })
+
+  test('outside any repository the session follows any worktree', async ($, on) => {
+    const { clock } = followWorld(on, { cwd: HOME, dirs: [HOME, ROOT, OTHER], byCwd: { [HOME]: { 'rev-parse --show-toplevel': NOT_A_REPO } } })
+    expect(await shown($)).toBe(`Not a git repository: ${HOME}`)
+    await editIn($, `${OTHER}/a.ts`)
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${OTHER} · auto`)
+  })
+
+  test('/wt-diff at pins a worktree over what Claude follows; at alone follows again', async ($, on) => {
+    const { state, clock } = followWorld(on)
+    state.dirs.add(`${WT2}/src`)
+    state.byCwd[`${WT2}/src`] = { 'rev-parse --show-toplevel': ok(`${WT2}\n`) }
+    expect((await wtDiff($, 'at ../t1-wt2')).text).toBe('Showing t1-wt2 (pinned)')
+    expect(await shown($)).toBe(`⌂ ${WT2} · pinned`)
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${WT2} · pinned`)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('⌂ t1-wt2 · pinned')
+    await ui.unmount()
+
+    expect((await wtDiff($, 'at')).text).toBe('Unpinned: following the worktree Claude works in.')
+    expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+    expect((await wtDiff($, `at "${WT2}/src"`)).text).toBe('Showing t1-wt2 (pinned)')
+    expect((await wtDiff($, 'at /nope')).text).toBe('Not a git worktree: /nope')
+    expect((await wtDiff($, 'at ~bob/x')).text).toBe('Not a path: ~bob/x')
+    expect(await shown($)).toBe(`⌂ ${WT2} · pinned`)
+    expect(USAGE).toContain('/wt-diff at <path>')
+  })
+
+  test('status, base and trunk act on the worktree shown', async ($, on) => {
+    const { clock } = followWorld(on)
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    const status = ((await wtDiff($, 'status')).text ?? '').split('\n')
+    expect(status.slice(0, 2)).toEqual([`⌂ ${ROOT} · auto`, 'feat → main   reflog · 73481c5'])
+    expect((await wtDiff($, 'base main')).text).toBe(`Base set to main for ${ROOT}.`)
+    expect(((await wtDiff($, 'status')).text ?? '').split('\n')[1]).toBe('feat → main   override · 73481c5')
+  })
+
+  test('a worktree removed gives way to the next in line and says so until the next move', async ($, on) => {
+    const { state, clock } = followWorld(on)
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    await wtDiff($, `at ${WT2}`)
+    // A git that only failed keeps it.
+    state.byCwd[WT2] = { ...wt2Answers, 'rev-parse --show-toplevel': fail(1, 'error: timed out\n') }
+    expect(await shown($)).toBe(`⌂ ${WT2} · pinned`)
+
+    state.dirs.delete(WT2)
+    expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('worktree removed — back to t1-wt')
+    expect((await ui.find({ type: 'Text', text: 'worktree removed — back to t1-wt' }))?.props.color).toBe('warning')
+
+    // No longer a worktree, though its directory stands: the session's own shows.
+    state.byCwd[ROOT] = { 'rev-parse --show-toplevel': NOT_A_REPO }
+    expect(await shown($)).toMatch(/^main/)
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('worktree removed — back to t1-repo')
+
+    // The next move clears it.
+    state.dirs.add(WT2)
+    state.byCwd[WT2] = wt2Answers
+    await editIn($, `${WT2}/a.txt`)
+    await landed(clock)
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('⌂ t1-wt2 · auto')
+    await ui.unmount()
+  })
+
+  test('a worktree inside the main checkout, removed while its directory comes back, gives way too', async ($, on) => {
+    // .claude/worktrees/x2 removed, a dev server writing its build dir again: git answers for the main checkout there.
+    const nested = `${REPO}/.claude/worktrees/x2`
+    const { state, clock } = followWorld(on, {
+      dirs: [REPO, nested, WT2],
+      byCwd: { [nested]: { ...wt2Answers, 'rev-parse --show-toplevel': ok(`${nested}\n`) } },
+    })
+    await editIn($, `${nested}/a.txt`)
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${nested} · auto`)
+    state.byCwd[nested] = { 'rev-parse --show-toplevel': ok(`${REPO}\n`) }
+    expect(await shown($)).toMatch(/^main/)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('worktree removed — back to t1-repo')
+
+    // Pinned, the same.
+    state.byCwd[nested] = { ...wt2Answers, 'rev-parse --show-toplevel': ok(`${nested}\n`) }
+    expect((await wtDiff($, `at ${nested}`)).text).toBe('Showing x2 (pinned)')
+    state.byCwd[nested] = { 'rev-parse --show-toplevel': ok(`${REPO}\n`) }
+    expect(await shown($)).toMatch(/^main/)
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('worktree removed — back to t1-repo')
+    await ui.unmount()
+  })
+
+  test('cd to the main checkout to remove the worktree followed says it was removed', async ($, on) => {
+    const nested = `${REPO}/.claude/worktrees/x2`
+    const { state, clock } = followWorld(on, { dirs: [REPO, ROOT, WT2, nested] })
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    state.dirs.delete(ROOT)
+    await $.tool.call({ tool: 'Bash', command: `cd ${REPO} && git worktree remove ${ROOT}` })
+    await landed(clock)
+    expect(await shown($)).toMatch(/^main/)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('worktree removed — back to t1-repo')
+
+    // Its directory left behind inside the main checkout: gone as well.
+    state.byCwd[nested] = { ...wt2Answers, 'rev-parse --show-toplevel': ok(`${nested}\n`) }
+    await editIn($, `${nested}/a.txt`)
+    await landed(clock)
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('⌂ x2 · auto')
+    state.byCwd[nested] = { 'rev-parse --show-toplevel': ok(`${REPO}\n`) }
+    await $.tool.call({ tool: 'Bash', command: `cd ${REPO} && git worktree remove --force .claude/worktrees/x2` })
+    await landed(clock)
+    expect((await screen(ui, 60))[0]?.trimEnd()).toBe('worktree removed — back to t1-repo')
+
+    // A worktree that stands is left without a word: back in the session's own.
+    await editIn($, `${WT2}/a.txt`)
+    await landed(clock)
+    await $.tool.call({ tool: 'Bash', command: `cd ${REPO} && git status` })
+    await landed(clock)
+    expect((await screen(ui, 60))[0]).toMatch(/^main/)
+    await ui.unmount()
+  })
+
+  test('EnterWorktree clears what was followed: the session’s new worktree shows', async ($, on) => {
+    const { state, clock } = followWorld(on)
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    state.enter.cwd = WT2
+    await $.tool.call({ tool: 'EnterWorktree', name: 'wt2' } as never)
+    await landed(clock)
+    expect(await shown($)).toMatch(/^fromhead/)
+  })
+})
+
+describe('worktree list', () => {
+  const pickKeys = async (ui: { findAll: (query: { type: string }) => Promise<{ key?: string }[]> }) =>
+    (await ui.findAll({ type: 'Button' })).map(button => button.key ?? '').filter(key => key.startsWith('pick:'))
+  const navButtons = async (ui: { findAll: (query: { type: string }) => Promise<{ key?: string; props: Record<string, unknown> }[]> }) =>
+    (await ui.findAll({ type: 'Button' })).filter(button => button.key?.startsWith('nav:')).map(button => [button.props.hotkey, button.props.label])
+
+  for (const diffView of ['side', 'inline'] as const) {
+    kitTest(`o lists auto and every worktree; j/k move, l picks, h and o go back, a click picks (${diffView})`, { options: { diffView } }, async ($, on) => {
+      followWorld(on, { cwd: ROOT })
+      await wtDiff($, 'refresh')
+      for (const surface of SURFACES) {
+        const pane = diffView === 'side' ? sidePane(90) : FOCUSED_PANE
+        const ui = await $.ui.mount({ ...pane, surface })
+        await keys(ui, 'o')
+        expect(await pickKeys(ui)).toEqual(['pick:auto', `pick:${REPO}`, `pick:${ROOT}`])
+        expect(await navButtons(ui)).toEqual([
+          ['j', 'down'],
+          ['k', 'up'],
+          ['l', 'select'],
+          ['h', 'back'],
+          ['o', 'back'],
+          ['q', 'close'],
+        ])
+        const hotkeys = (await ui.findAll({ type: 'Button' })).map(button => button.props.hotkey).filter(Boolean)
+        expect(new Set(hotkeys).size).toBe(hotkeys.length)
+        expect(await autoFocused(ui)).toBe('pick:auto')
+        expect(await rowLine(ui, 'pick:auto', 90)).toMatch(/^› ✓ auto {2}follow Claude/)
+        expect(await rowLine(ui, `pick:${REPO}`, 90)).toBe(`    t1-repo  main  ${REPO}`)
+        // Unpinned, the worktree on show is dotted.
+        expect(await rowLine(ui, `pick:${ROOT}`, 90)).toMatch(/^ {2}• t1-wt {2}feat/)
+        if (diffView === 'side') expect(await screen(ui, 90)).toHaveLength(24)
+
+        // j and l: the main checkout, pinned.
+        await keys(ui, 'jl')
+        expect(await pickKeys(ui)).toEqual([])
+        expect(await shown($)).toBe(`⌂ ${REPO} · pinned`)
+        expect((await screen(ui, 90))[0]?.trimEnd()).toBe('⌂ t1-repo · pinned')
+        // Again: the cursor and the tick on the pin; h goes back with nothing changed.
+        await keys(ui, 'o')
+        expect(await rowLine(ui, `pick:${REPO}`, 90)).toMatch(/^› ✓ t1-repo/)
+        expect(await rowLine(ui, 'pick:auto', 90)).toMatch(/^ {4}auto/)
+        expect(await rowLine(ui, `pick:${ROOT}`, 90)).toMatch(/^ {4}t1-wt/)
+        await keys(ui, 'jjjh')
+        expect(await pickKeys(ui)).toEqual([])
+        expect(await shown($)).toBe(`⌂ ${REPO} · pinned`)
+        // o goes back too; a click on auto follows again.
+        await keys(ui, 'oo')
+        expect(await pickKeys(ui)).toEqual([])
+        await keys(ui, 'o')
+        await ui.press({ key: 'pick:auto' })
+        expect(await pickKeys(ui)).toEqual([])
+        expect(await shown($)).toMatch(/^feat/)
+        // The keys are the view's own again.
+        expect((await navButtons(ui)).map(([hotkey]) => hotkey)).toContain('o')
+        expect((await navButtons(ui)).map(([hotkey]) => hotkey)).toContain('g')
+        await ui.unmount()
+      }
+    })
+  }
+
+  test('o says the detached worktree by its short sha; a click on a worktree pins it', async ($, on) => {
+    followWorld(on, {
+      cwd: ROOT,
+      table: featTable({
+        'worktree list --porcelain': ok(`${PORCELAIN_FEAT}worktree ${WT2}\nHEAD e47b652208a1df9b8a3cbff954e65fc4b24fd4db\ndetached\n\n`),
+      }),
+    })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...FOCUSED_PANE, surface: 'terminal' })
+    await keys(ui, 'o')
+    expect(await rowLine(ui, `pick:${WT2}`)).toBe(`    t1-wt2  e47b652  ${WT2}`)
+    await ui.press({ key: `pick:${WT2}` })
+    expect(await shown($)).toBe(`⌂ ${WT2} · pinned`)
+    await ui.unmount()
+  })
+
+  test('o leaves out a worktree deleted without git worktree remove', async ($, on) => {
+    followWorld(on, {
+      cwd: ROOT,
+      table: featTable({
+        'worktree list --porcelain': ok(
+          `${PORCELAIN_FEAT}worktree ${WT2}\nHEAD e47b652208a1df9b8a3cbff954e65fc4b24fd4db\nbranch refs/heads/fromhead\nprunable gitdir file points to non-existent location\n\n`,
+        ),
+      }),
+    })
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...FOCUSED_PANE, surface: 'terminal' })
+    await keys(ui, 'o')
+    expect(await pickKeys(ui)).toEqual(['pick:auto', `pick:${REPO}`, `pick:${ROOT}`])
+    await ui.unmount()
+  })
+})
+
+describe('auto-open on follow', () => {
+  test('the first linked worktree followed opens the pane, where panes dock, without the keyboard', async ($, on) => {
+    const { state, clock } = followWorld(on, { isOpen: false })
+    await drawHint($, true)
+    await $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    expect(state.opened).toBe(0)
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    expect(state.opened).toBe(1)
+    expect(state.openArgs.at(-1)).not.toHaveProperty('focus')
+    // Once: closed by the plugin's own hand it stays closed on the next.
+    state.isOpen = false
+    await editIn($, `${WT2}/a.txt`)
+    await landed(clock)
+    expect(state.opened).toBe(1)
+  })
+
+  test('a pane the person closed is not opened for a follow', async ($, on) => {
+    const { state, clock } = followWorld(on, { isOpen: true })
+    await drawHint($, true)
+    // The kit raises no ui.close of the person's: /wt-diff close is theirs too.
+    expect((await wtDiff($, 'close')).text).toBe('Changes pane closed.')
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    expect(state.opened).toBe(0)
+  })
+
+  test('q counts as the person closing it', async ($, on) => {
+    const { state, clock } = followWorld(on, { table: treeTable(), files: treeFiles })
+    await drawHint($, true)
+    await wtDiff($, 'refresh')
+    const ui = await $.ui.mount({ ...FOCUSED_PANE, surface: 'terminal' })
+    await keys(ui, 'q')
+    await ui.unmount()
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    expect(state.opened).toBe(0)
+  })
+
+  test('a session no one watches arms no open, and a closed pane reads no git on later triggers', async ($, on) => {
+    const { state, clock } = followWorld(on, { isOpen: false })
+    await drawHint($, true)
+    await $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: false })
+    await clock.settle()
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    expect(state.opened).toBe(0)
+    expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+    const before = state.calls.length
+    await $.turn.complete({ reason: 'answer', text: '' } as never)
+    await clock.advance(300)
+    await clock.settle()
+    expect(state.calls.length).toBe(before)
+  })
+
+  test('a follow while a pass reads the last worktree opens the pane once the next pass reads this one', { options: { statusLine: true } }, async ($, on) => {
+    const { state, clock } = followWorld(on, { isOpen: false })
+    await drawHint($, true)
+    await $.session.start({ cwd: REPO, surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    // A pass of the main checkout's, held at its first git call.
+    const held = gate()
+    let isHeld = false
+    state.hold = held.promise
+    state.onHold = () => {
+      isHeld = true
+    }
+    await $.turn.complete({ reason: 'answer', text: '' } as never)
+    await clock.advance(300)
+    await clock.settle()
+    expect(isHeld).toBe(true)
+    state.hold = undefined
+    // Followed meanwhile; the pass ends with the main checkout's snapshot before the follow's own refresh is due.
+    await editIn($, `${ROOT}/a.txt`)
+    await clock.settle()
+    expect(state.opened).toBe(0)
+    held.open()
+    await landed(clock)
+    expect(await shown($)).toBe(`⌂ ${ROOT} · auto`)
+    expect(state.opened).toBe(1)
+  })
+
+  test('never opens nothing on a follow', { options: { autoOpen: 'never' } }, async ($, on) => {
+    const { state, clock } = followWorld(on, { isOpen: false })
+    await drawHint($, true)
+    await editIn($, `${ROOT}/a.txt`)
+    await landed(clock)
+    expect(state.opened).toBe(0)
   })
 })

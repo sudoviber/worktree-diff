@@ -1,6 +1,6 @@
 {
   "name": "worktree-diff",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "A side pane showing what the current git worktree changed versus the branch it came from",
   "author": { "name": "sudoviber", "url": "https://github.com/sudoviber" },
   "license": "MIT",
@@ -9,7 +9,7 @@
     "autoOpen": {
       "type": "string",
       "title": "Auto-open the Changes pane",
-      "description": "worktree: when the session is in a linked git worktree; always: in any git repository; never: only with /wt-diff",
+      "description": "worktree: when the session is in a linked git worktree, or Claude is first followed into one; always: in any git repository; never: only with /wt-diff",
       "default": "worktree",
       "options": ["worktree", "always", "never"]
     },
